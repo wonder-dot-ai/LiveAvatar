@@ -329,6 +329,27 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to enable fp8 quantization.")
+    # Profiling arguments
+    parser.add_argument(
+        "--enable_profiling",
+        action="store_true",
+        default=False,
+        help="Enable VRAM and latency profiling for all pipeline phases.")
+    parser.add_argument(
+        "--profile_output_dir",
+        type=str,
+        default="profiling_output",
+        help="Directory for profiling outputs (JSON, traces, charts).")
+    parser.add_argument(
+        "--profile_num_clips",
+        type=int,
+        default=2,
+        help="Number of clips to profile (limits duration).")
+    parser.add_argument(
+        "--torch_trace",
+        action="store_true",
+        default=False,
+        help="Export torch.profiler Chrome traces and memory snapshots.")
     args = parser.parse_args()
 
     _validate_args(args)
@@ -450,48 +471,106 @@ def generate(args, training_settings):
         args.prompt = input_prompt[0]
         logging.info(f"Extended prompt: {args.prompt}")
 
-    if "s2v" in args.task:
-        logging.info("Creating WanS2V pipeline.")
-        wan_s2v = WanS2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
-            sp_size=args.ulysses_size,
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            single_gpu=args.single_gpu,
-            offload_kv_cache=args.offload_kv_cache,
+    # ── Profiler setup ──
+    profiler = None
+    if args.enable_profiling:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from profiler_utils import VRAMProfiler
+        os.makedirs(args.profile_output_dir, exist_ok=True)
+        # In multi-GPU mode, each rank gets its own profiling log
+        _profile_suffix = f"_rank{rank}" if world_size > 1 else ""
+        profiler = VRAMProfiler(
+            device=f"cuda:{local_rank}",
+            log_path=os.path.join(args.profile_output_dir, f"vram_profile{_profile_suffix}.json"),
         )
+        if args.profile_num_clips and args.profile_num_clips > 0:
+            args.num_clip = args.profile_num_clips
+
+    if "s2v" in args.task:
+        # A1: Pipeline init (loads T5, VAE, DiT, Audio models)
+        logging.info("Creating WanS2V pipeline.")
+        if profiler:
+            with profiler.track("pipeline_init", "init"):
+                wan_s2v = WanS2V(
+                    config=cfg,
+                    checkpoint_dir=args.ckpt_dir,
+                    device_id=device,
+                    rank=rank,
+                    t5_fsdp=args.t5_fsdp,
+                    dit_fsdp=args.dit_fsdp,
+                    use_sp=(args.ulysses_size > 1),
+                    sp_size=args.ulysses_size,
+                    t5_cpu=args.t5_cpu,
+                    convert_model_dtype=args.convert_model_dtype,
+                    single_gpu=args.single_gpu,
+                    offload_kv_cache=args.offload_kv_cache,
+                )
+        else:
+            wan_s2v = WanS2V(
+                config=cfg,
+                checkpoint_dir=args.ckpt_dir,
+                device_id=device,
+                rank=rank,
+                t5_fsdp=args.t5_fsdp,
+                dit_fsdp=args.dit_fsdp,
+                use_sp=(args.ulysses_size > 1),
+                sp_size=args.ulysses_size,
+                t5_cpu=args.t5_cpu,
+                convert_model_dtype=args.convert_model_dtype,
+                single_gpu=args.single_gpu,
+                offload_kv_cache=args.offload_kv_cache,
+            )
+
+        # A2: LoRA loading
         if args.load_lora and args.lora_path_dmd is not None:
             print(f'Use LoRA: lora path: {args.lora_path_dmd}, lora rank:', training_settings['lora_rank'] ,", lora alpha: ",training_settings['lora_alpha'])
 
-
             if args.lora_path_dmd is not None:
-                wan_s2v.noise_model = wan_s2v.add_lora_to_model(
-                    wan_s2v.noise_model,
-                    lora_rank=training_settings['lora_rank'],
-                    lora_alpha=training_settings['lora_alpha'],
-                    lora_target_modules=training_settings['lora_target_modules'],
-                    init_lora_weights=training_settings['init_lora_weights'],
-                    pretrained_lora_path=args.lora_path_dmd,
-                    load_lora_weight_only=False,
-                )
+                if profiler:
+                    with profiler.track("lora_loading", "init"):
+                        wan_s2v.noise_model = wan_s2v.add_lora_to_model(
+                            wan_s2v.noise_model,
+                            lora_rank=training_settings['lora_rank'],
+                            lora_alpha=training_settings['lora_alpha'],
+                            lora_target_modules=training_settings['lora_target_modules'],
+                            init_lora_weights=training_settings['init_lora_weights'],
+                            pretrained_lora_path=args.lora_path_dmd,
+                            load_lora_weight_only=False,
+                        )
+                else:
+                    wan_s2v.noise_model = wan_s2v.add_lora_to_model(
+                        wan_s2v.noise_model,
+                        lora_rank=training_settings['lora_rank'],
+                        lora_alpha=training_settings['lora_alpha'],
+                        lora_target_modules=training_settings['lora_target_modules'],
+                        init_lora_weights=training_settings['init_lora_weights'],
+                        pretrained_lora_path=args.lora_path_dmd,
+                        load_lora_weight_only=False,
+                    )
 
+        # A3: FP8 quantization
         if args.fp8:
             if hasattr(torch, "_scaled_mm"):
                 from liveavatar.utils.fp8_linear import replace_linear_with_scaled_fp8
-                replace_linear_with_scaled_fp8(
-                    wan_s2v.noise_model,
-                    ignore_keys=[
-                        'text_embedding', 'time_embedding',
-                        'time_projection', 'head.head',
-                        'casual_audio_encoder.encoder.final_linear',
-                    ]
-                )
+                if profiler:
+                    with profiler.track("fp8_quantization", "init"):
+                        replace_linear_with_scaled_fp8(
+                            wan_s2v.noise_model,
+                            ignore_keys=[
+                                'text_embedding', 'time_embedding',
+                                'time_projection', 'head.head',
+                                'casual_audio_encoder.encoder.final_linear',
+                            ]
+                        )
+                else:
+                    replace_linear_with_scaled_fp8(
+                        wan_s2v.noise_model,
+                        ignore_keys=[
+                            'text_embedding', 'time_embedding',
+                            'time_projection', 'head.head',
+                            'casual_audio_encoder.encoder.final_linear',
+                        ]
+                    )
 
             else:
                 logging.info(f"skip fp8_linear, Please update torch vision ")
@@ -499,7 +578,8 @@ def generate(args, training_settings):
         # Prepare video path for SAM2 processing (will be handled in pipeline)
         logging.info(f"Generating video ...")
 
-        video,dataset_info = wan_s2v.generate(
+        # Pass profiler and torch_trace settings to pipeline
+        _generate_kwargs = dict(
             input_prompt=args.prompt,
             ref_image_path=args.image,
             audio_path=args.audio,
@@ -526,18 +606,23 @@ def generate(args, training_settings):
             enable_vae_parallel=args.enable_vae_parallel,
             input_video_for_sam2=None,
             enable_online_decode=args.enable_online_decode,
+            profiler=profiler,
+            torch_trace=args.torch_trace,
+            profile_output_dir=args.profile_output_dir,
         )
+
+        video, dataset_info = wan_s2v.generate(**_generate_kwargs)
     else:
         assert False, "Only s2v is supported for now."
-    
+
 
     print(f"denoising video done")
     print(f"rank: {rank}")
     if args.enable_vae_parallel:
-        save_rank = args.num_gpus_dit 
+        save_rank = args.num_gpus_dit
     else:
-        save_rank = 0 if world_size == 1 else args.num_gpus_dit-1 
-    
+        save_rank = 0 if world_size == 1 else args.num_gpus_dit-1
+
     if rank == save_rank:
         if '+' in args.audio:
             audio_paths = args.audio.split('+')
@@ -570,19 +655,52 @@ def generate(args, training_settings):
             os.makedirs(args.save_dir, exist_ok=True)
             args.save_file = args.save_dir + args.save_file + suffix
         logging.info(f"Saving generated video to {args.save_file}")
-        save_video(
-            tensor=video[None],
-            save_file=args.save_file,
-            fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1))
-        if "s2v" in args.task:
-            if args.enable_tts is False:
-                merge_video_audio(video_path=args.save_file, audio_path=args.audio)
-            else:
-                merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
+        if profiler:
+            with profiler.track("video_save", "io"):
+                save_video(
+                    tensor=video[None],
+                    save_file=args.save_file,
+                    fps=cfg.sample_fps,
+                    nrow=1,
+                    normalize=True,
+                    value_range=(-1, 1))
+            with profiler.track("audio_merge", "io"):
+                if "s2v" in args.task:
+                    if args.enable_tts is False:
+                        merge_video_audio(video_path=args.save_file, audio_path=args.audio)
+                    else:
+                        merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
+        else:
+            save_video(
+                tensor=video[None],
+                save_file=args.save_file,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1))
+            if "s2v" in args.task:
+                if args.enable_tts is False:
+                    merge_video_audio(video_path=args.save_file, audio_path=args.audio)
+                else:
+                    merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
     del video
+
+    # ── Profiler finalization ──
+    if profiler:
+        profiler.save()
+        profiler.summary_table()
+        # Only rank 0 (or single-GPU) generates charts
+        if rank == 0 or world_size == 1:
+            try:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                from visualize_profile import main as viz_main
+                _orig_argv = sys.argv
+                sys.argv = ["visualize_profile", profiler.log_path]
+                viz_main()
+                sys.argv = _orig_argv
+            except Exception as e:
+                print(f"[PROFILE] Visualization failed (non-fatal): {e}")
+                print(f"[PROFILE] Run manually: python minimal_inference/visualize_profile.py {profiler.log_path}")
 
     torch.cuda.synchronize()
     if dist.is_initialized():

@@ -698,6 +698,9 @@ class WanS2V:
         mask=None,
         input_video_for_sam2=None,
         enable_online_decode=False,
+        profiler=None,
+        torch_trace=False,
+        profile_output_dir=None,
     ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -768,10 +771,16 @@ class WanS2V:
         if enable_tts is True:
             audio_path = self.tts(tts_prompt_audio, tts_prompt_text, tts_text)
         # audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
-        self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
-        self.audio_encoder.model.requires_grad_(False)
-        self.audio_encoder.model.eval()
-        
+        if profiler:
+            with profiler.track("audio_encoder_to_gpu", "offload"):
+                self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
+                self.audio_encoder.model.requires_grad_(False)
+                self.audio_encoder.model.eval()
+        else:
+            self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
+            self.audio_encoder.model.requires_grad_(False)
+            self.audio_encoder.model.eval()
+
         if '+' in audio_path:
             audio_paths = audio_path.split('+')
             audio_embs = []
@@ -874,10 +883,17 @@ class WanS2V:
             mask = (~others_present).to(dtype=mask.dtype)
             m=(mask[0][0].detach().to(torch.float16).cpu().numpy()>0.5).astype(np.uint8)*255; Image.fromarray(m.squeeze()).save("tmp/mask/mask.png")
         else:
-            audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
+            if profiler:
+                with profiler.track("audio_encoding", "encode"):
+                    audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
+            else:
+                audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
 
-        
-        self.audio_encoder.model.to("cpu")
+        if profiler:
+            with profiler.track("audio_encoder_to_cpu", "offload"):
+                self.audio_encoder.model.to("cpu")
+        else:
+            self.audio_encoder.model.to("cpu")
         if num_repeat is None or num_repeat > nr:
             num_repeat = nr
 
@@ -889,23 +905,39 @@ class WanS2V:
             0) * 2 - 1.0  # b c 1 h w
         ref_pixel_values = ref_pixel_values.to(
             dtype=self.vae.dtype, device=self.vae.device)
-        ref_latents = torch.stack(self.vae.encode(ref_pixel_values))
+        if profiler:
+            with profiler.track("vae_encode_ref_image", "vae"):
+                ref_latents = torch.stack(self.vae.encode(ref_pixel_values))
+        else:
+            ref_latents = torch.stack(self.vae.encode(ref_pixel_values))
 
         # drop_first_motion = self.drop_first_motion
         drop_first_motion = False
         motion_latents = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)
         videos_last_frames = motion_latents.detach()
-        motion_latents = torch.stack(self.vae.encode(motion_latents))
+        if profiler:
+            with profiler.track("vae_encode_motion_init", "vae"):
+                motion_latents = torch.stack(self.vae.encode(motion_latents))
+        else:
+            motion_latents = torch.stack(self.vae.encode(motion_latents))
         
         if drop_motion_noisy:
             zero_motion_latents = torch.zeros_like(motion_latents)
 
         # get pose cond input if need
-        COND = self.load_pose_cond(
-            pose_video=pose_video,
-            num_repeat=num_repeat,
-            infer_frames=infer_frames,
-            size=size) # list(1):[1,16,12,48,32]当num_repeat=1
+        if profiler:
+            with profiler.track("pose_cond_loading", "encode"):
+                COND = self.load_pose_cond(
+                    pose_video=pose_video,
+                    num_repeat=num_repeat,
+                    infer_frames=infer_frames,
+                    size=size)
+        else:
+            COND = self.load_pose_cond(
+                pose_video=pose_video,
+                num_repeat=num_repeat,
+                infer_frames=infer_frames,
+                size=size) # list(1):[1,16,12,48,32]当num_repeat=1
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
 
@@ -913,7 +945,11 @@ class WanS2V:
             n_prompt = self.sample_neg_prompt
 
         # process prompt
-        context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model) #list(1):[len,4096]
+        if profiler:
+            with profiler.track("text_encoding", "encode"):
+                context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model)
+        else:
+            context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model) #list(1):[len,4096]
         dataset_info = {}
 
         print("complete prepare conditional inputs")
@@ -961,20 +997,25 @@ class WanS2V:
                     clip_output = torch.zeros_like(clip_noise[0]) #[16,f,h,w]
                     max_seq_len = np.prod(target_shape) // 4
                     if self.kv_cache1 is None:
-                        local_rank = torch.distributed.get_rank()
-                        if local_rank < num_gpus_dit:
-                            self._initialize_kv_cache(
-                                    batch_size=1,
-                                    dtype=self.param_dtype,
-                                    device=f"cuda:{local_rank}",
-                                    kv_cache_size=max_seq_len
-                                )
-
-                        self._initialize_crossattn_cache(
-                            batch_size=1,
-                            dtype=self.param_dtype,
-                            device=self.device
-                        )
+                        def _do_kv_cache_init_tpp():
+                            local_rank = torch.distributed.get_rank()
+                            if local_rank < num_gpus_dit:
+                                self._initialize_kv_cache(
+                                        batch_size=1,
+                                        dtype=self.param_dtype,
+                                        device=f"cuda:{local_rank}",
+                                        kv_cache_size=max_seq_len
+                                    )
+                            self._initialize_crossattn_cache(
+                                batch_size=1,
+                                dtype=self.param_dtype,
+                                device=self.device
+                            )
+                        if profiler:
+                            with profiler.track("kv_cache_init", "cache"):
+                                _do_kv_cache_init_tpp()
+                        else:
+                            _do_kv_cache_init_tpp()
 
 
                 #----------------------------------------------Step 2.2: prepare clip-level cond---------------------------------
@@ -996,33 +1037,41 @@ class WanS2V:
                 #-----------------------------------------------Temporal denoising loop in single clip---------------------------------
                 # 2.2.0 prefill cond caching
                 if (r==0 or r==1) and (dist.get_rank() != num_gpus_dit-1+int(enable_vae_parallel)): #考虑要不要r==1的时候替换一下ref cond，如果要的话clip r=0的时候还不能并行，要让每卡都有clean的latent0
-                    if r==1:
-                        ref_latents = torch.empty_like(ref_latents).type_as(clip_latents[0])
-                        dist.broadcast(ref_latents, src=num_gpus_dit-1+int(enable_vae_parallel))
-                    block_index = 0
-                    block_latents = clip_latents[0][:, block_index *
-                                    self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
-                    left_idx = block_index * (self.num_frames_per_block * 4)
-                    right_idx = (block_index+1) * (self.num_frames_per_block * 4)
-                    block_arg_c = {
-                        'context': context[0:1], #list(1) torch.Size([19, 4096])
-                        'seq_len': None,
-                        'cond_states': cond_latents[:,:,block_index * 
-                                        self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block],
-                        "motion_latents": input_motion_latents,
-                        'ref_latents': ref_latents,
-                        "audio_input": audio_input[..., left_idx:right_idx],
-                        "motion_frames": [self.motion_frames, lat_motion_frames],
-                        "drop_motion_frames": drop_first_motion and r == 0,
-                        "sink_flag": True,
-                    }
-                    timestep = torch.ones(
-                        [1, self.num_frames_per_block], device=self.device, dtype=self.param_dtype) * 0
-                    self.noise_model( #update clean kv cache
-                        [block_latents], t=timestep*0, **block_arg_c, 
-                        kv_cache=self.kv_cache1, crossattn_cache=self.crossattn_cache,
-                        current_start=block_index * self.num_frames_per_block * frame_seq_length,
-                        current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length)
+                    def _do_prefill_cond_tpp():
+                        nonlocal ref_latents
+                        if r==1:
+                            ref_latents = torch.empty_like(ref_latents).type_as(clip_latents[0])
+                            dist.broadcast(ref_latents, src=num_gpus_dit-1+int(enable_vae_parallel))
+                        block_index = 0
+                        block_latents = clip_latents[0][:, block_index *
+                                        self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
+                        left_idx = block_index * (self.num_frames_per_block * 4)
+                        right_idx = (block_index+1) * (self.num_frames_per_block * 4)
+                        block_arg_c = {
+                            'context': context[0:1], #list(1) torch.Size([19, 4096])
+                            'seq_len': None,
+                            'cond_states': cond_latents[:,:,block_index *
+                                            self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block],
+                            "motion_latents": input_motion_latents,
+                            'ref_latents': ref_latents,
+                            "audio_input": audio_input[..., left_idx:right_idx],
+                            "motion_frames": [self.motion_frames, lat_motion_frames],
+                            "drop_motion_frames": drop_first_motion and r == 0,
+                            "sink_flag": True,
+                        }
+                        timestep = torch.ones(
+                            [1, self.num_frames_per_block], device=self.device, dtype=self.param_dtype) * 0
+                        self.noise_model( #update clean kv cache
+                            [block_latents], t=timestep*0, **block_arg_c,
+                            kv_cache=self.kv_cache1, crossattn_cache=self.crossattn_cache,
+                            current_start=block_index * self.num_frames_per_block * frame_seq_length,
+                            current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length)
+
+                    if profiler:
+                        with profiler.track(f"prefill_cond_cache_clip{r}", "cache"):
+                            _do_prefill_cond_tpp()
+                    else:
+                        _do_prefill_cond_tpp()
                         
 
 
@@ -1061,42 +1110,80 @@ class WanS2V:
                     for i, t in enumerate(tqdm(timesteps)):
                         if i != dist.get_rank():
                             continue
+
+                        _rank = dist.get_rank()
+
+                        # Receive latents from previous GPU in pipeline
                         if self.src_gpu is None:
-                            latent_model_input = block_latents #[16,num_frames_per_block,h,w]
-                        else:  
-                            latent_model_input = torch.empty_like(block_latents)  # 创建空tensor接收
-                            dist.recv(latent_model_input, self.src_gpu)
+                            latent_model_input = block_latents
+                        else:
+                            if profiler:
+                                with profiler.track(f"dist_recv_clip{r}_block{block_index}_rank{_rank}", "cache"):
+                                    latent_model_input = torch.empty_like(block_latents)
+                                    dist.recv(latent_model_input, self.src_gpu)
+                            else:
+                                latent_model_input = torch.empty_like(block_latents)
+                                dist.recv(latent_model_input, self.src_gpu)
 
                         timestep = [t] * self.num_frames_per_block
                         timestep = torch.tensor(timestep).to(self.device).unsqueeze(0)
-                        
 
-                        noise_pred_cond = self.noise_model(
-                            [latent_model_input], t=timestep, **block_arg_c, 
+                        _dit_kwargs = dict(
+                            t=timestep,
+                            **block_arg_c,
                             kv_cache=self.kv_cache1, crossattn_cache=self.crossattn_cache,
                             current_start=block_index * self.num_frames_per_block * frame_seq_length + r * num_blocks * self.num_frames_per_block * frame_seq_length,
                             current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length + r * num_blocks *self.num_frames_per_block * frame_seq_length,
                             mask=mask)
 
-                        noise_pred = [torch.cat(noise_pred_cond, dim=0)]
+                        if profiler:
+                            with profiler.track(f"dit_forward_clip{r}_block{block_index}_rank{_rank}", "dit"):
+                                noise_pred_cond = self.noise_model(
+                                    [latent_model_input], **_dit_kwargs)
 
-                        temp_x0 = sample_scheduler.step(
-                            noise_pred[0].unsqueeze(0),# [16,f,h,w]
-                            t,
-                            latent_model_input.unsqueeze(0), #[1,16,f,h,w]
-                            return_dict=False,
-                            generator=seed_g)[0]
-                        block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
-                        if self.tgt_gpu is None:
-                            pass
+                            noise_pred = [torch.cat(noise_pred_cond, dim=0)]
+
+                            with profiler.track(f"scheduler_step_clip{r}_block{block_index}_rank{_rank}", "scheduler"):
+                                temp_x0 = sample_scheduler.step(
+                                    noise_pred[0].unsqueeze(0),
+                                    t,
+                                    latent_model_input.unsqueeze(0),
+                                    return_dict=False,
+                                    generator=seed_g)[0]
+                            block_latents = temp_x0.squeeze(0)
                         else:
-                            dist.send(block_latents.contiguous(), self.tgt_gpu)
+                            noise_pred_cond = self.noise_model(
+                                [latent_model_input], **_dit_kwargs)
+
+                            noise_pred = [torch.cat(noise_pred_cond, dim=0)]
+
+                            temp_x0 = sample_scheduler.step(
+                                noise_pred[0].unsqueeze(0),# [16,f,h,w]
+                                t,
+                                latent_model_input.unsqueeze(0), #[1,16,f,h,w]
+                                return_dict=False,
+                                generator=seed_g)[0]
+                            block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
+
+                        # Send to next GPU in pipeline
+                        if self.tgt_gpu is not None:
+                            if profiler:
+                                with profiler.track(f"dist_send_clip{r}_block{block_index}_rank{_rank}", "cache"):
+                                    dist.send(block_latents.contiguous(), self.tgt_gpu)
+                            else:
+                                dist.send(block_latents.contiguous(), self.tgt_gpu)
  
                     if enable_vae_parallel and dist.get_rank() == num_gpus_dit-1+int(enable_vae_parallel):
                             vae_wait_start = time.time()
-                            block_latents = torch.empty_like(block_latents)
-                            dist.recv(block_latents, self.src_gpu)
-                            torch.cuda.synchronize()
+                            if profiler:
+                                with profiler.track(f"vae_recv_latents_clip{r}_block{block_index}", "cache"):
+                                    block_latents = torch.empty_like(block_latents)
+                                    dist.recv(block_latents, self.src_gpu)
+                                    torch.cuda.synchronize()
+                            else:
+                                block_latents = torch.empty_like(block_latents)
+                                dist.recv(block_latents, self.src_gpu)
+                                torch.cuda.synchronize()
                             if time.time() - vae_wait_start < 0.01:
                                 print(f"WARNING: VAE serves as a bottleneck!")
 
@@ -1104,12 +1191,18 @@ class WanS2V:
                     if enable_vae_parallel and dist.get_rank() == num_gpus_dit-1+int(enable_vae_parallel):
                         if offload_model:
                             print(f"offloading model to cpu")
-                            self.noise_model.cpu()
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                            if profiler:
+                                with profiler.track(f"offload_dit_cpu_vae_gpu_block{block_index}", "offload"):
+                                    self.noise_model.cpu()
+                                    torch.cuda.synchronize()
+                                    torch.cuda.empty_cache()
+                            else:
+                                self.noise_model.cpu()
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
                         if r == 0 and active_nr != 1:
                             if block_index == 0: #cache new ref
-                                ref_latents = block_latents.unsqueeze(0)[:,:,0:1] # 更新attention sink anchor到generated image，broadcast到所有rank
+                                ref_latents = block_latents.unsqueeze(0)[:,:,0:1]
                             elif block_index == num_blocks-1: #broadcast ref to all ranks
                                 dist.broadcast(ref_latents.contiguous(), src=num_gpus_dit-1+int(enable_vae_parallel))
                             else:
@@ -1118,15 +1211,23 @@ class WanS2V:
                         # decode to rgb
                         if r == 0 and block_index == 0:
                             decode_latents = motion_latents[:,:,:7]
-                            self.vae.stream_decode(decode_latents)
+                            if profiler:
+                                with profiler.track("vae_stream_decode_warmup", "vae"):
+                                    self.vae.stream_decode(decode_latents)
+                            else:
+                                self.vae.stream_decode(decode_latents)
                         decode_latents = block_latents.unsqueeze(0)
 
-                        image = torch.stack(self.vae.stream_decode(decode_latents))
+                        if profiler:
+                            with profiler.track(f"vae_stream_decode_clip{r}_block{block_index}", "vae"):
+                                image = torch.stack(self.vae.stream_decode(decode_latents))
+                        else:
+                            image = torch.stack(self.vae.stream_decode(decode_latents))
                         image = image[:, :, -(infer_frames)//num_blocks:] # 3
-                        
+
                         if r == 0 and block_index == 0:
                             image = image[:, :, 3:]#第一个clip第一个block保留0帧，后面3
-                 
+
                         out.append(image.cpu())
 
         #-------------------------------------- Step 3: full-video postprocess--------------------------------------

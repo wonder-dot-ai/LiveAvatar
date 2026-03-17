@@ -690,6 +690,9 @@ class WanS2V:
         mask=None,
         input_video_for_sam2=None,
         enable_online_decode=False,
+        profiler=None,
+        torch_trace=False,
+        profile_output_dir=None,
     ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -760,10 +763,17 @@ class WanS2V:
         if enable_tts is True:
             audio_path = self.tts(tts_prompt_audio, tts_prompt_text, tts_text)
         # audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
-        self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
-        self.audio_encoder.model.requires_grad_(False)
-        self.audio_encoder.model.eval()
-        self.vae.model.to(self.device)
+        if profiler:
+            with profiler.track("audio_encoder_to_gpu", "offload"):
+                self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
+                self.audio_encoder.model.requires_grad_(False)
+                self.audio_encoder.model.eval()
+                self.vae.model.to(self.device)
+        else:
+            self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
+            self.audio_encoder.model.requires_grad_(False)
+            self.audio_encoder.model.eval()
+            self.vae.model.to(self.device)
         
         if '+' in audio_path:
             audio_paths = audio_path.split('+')
@@ -867,16 +877,17 @@ class WanS2V:
             mask = (~others_present).to(dtype=mask.dtype)
             m=(mask[0][0].detach().to(torch.float16).cpu().numpy()>0.5).astype(np.uint8)*255; Image.fromarray(m.squeeze()).save("tmp/mask/mask.png")
         else:
-            audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
-            # print(f"nr: {nr}")
-            # print(f"audio_emb num clip: {audio_emb.shape[-1]//infer_frames}")
-            # assert audio_emb.shape[-1]//infer_frames == nr
-            # num_repeat_clip = 3334 // nr + 1 #10000 seconds
-            # print(f"num_repeat_clip: {num_repeat_clip}")
-            # nr = nr * num_repeat_clip
-            # audio_emb = torch.cat([audio_emb]*num_repeat_clip, dim=-1)
-        
-        self.audio_encoder.model.to("cpu")
+            if profiler:
+                with profiler.track("audio_encoding", "encode"):
+                    audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
+            else:
+                audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
+
+        if profiler:
+            with profiler.track("audio_encoder_to_cpu", "offload"):
+                self.audio_encoder.model.to("cpu")
+        else:
+            self.audio_encoder.model.to("cpu")
         if num_repeat is None or num_repeat > nr:
             num_repeat = nr
 
@@ -889,23 +900,39 @@ class WanS2V:
         ref_pixel_values = ref_pixel_values.to(
             dtype=self.vae.dtype, device=self.vae.device)
         ref_pixel_values = ref_pixel_values.repeat(1, 1, 5, 1, 1)
-        ref_latents = torch.stack(self.vae.encode(ref_pixel_values))[:,:,1:]
+        if profiler:
+            with profiler.track("vae_encode_ref_image", "vae"):
+                ref_latents = torch.stack(self.vae.encode(ref_pixel_values))[:,:,1:]
+        else:
+            ref_latents = torch.stack(self.vae.encode(ref_pixel_values))[:,:,1:]
 
         # drop_first_motion = self.drop_first_motion
         drop_first_motion = False
         motion_latents = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)
         videos_last_frames = motion_latents.detach()
-        motion_latents = torch.stack(self.vae.encode(motion_latents))
+        if profiler:
+            with profiler.track("vae_encode_motion_init", "vae"):
+                motion_latents = torch.stack(self.vae.encode(motion_latents))
+        else:
+            motion_latents = torch.stack(self.vae.encode(motion_latents))
         
         if drop_motion_noisy:
             zero_motion_latents = torch.zeros_like(motion_latents)
 
         # get pose cond input if need
-        COND = self.load_pose_cond(
-            pose_video=pose_video,
-            num_repeat=num_repeat,
-            infer_frames=infer_frames,
-            size=size) # list(1):[1,16,12,48,32]当num_repeat=1
+        if profiler:
+            with profiler.track("pose_cond_loading", "encode"):
+                COND = self.load_pose_cond(
+                    pose_video=pose_video,
+                    num_repeat=num_repeat,
+                    infer_frames=infer_frames,
+                    size=size)
+        else:
+            COND = self.load_pose_cond(
+                pose_video=pose_video,
+                num_repeat=num_repeat,
+                infer_frames=infer_frames,
+                size=size) # list(1):[1,16,12,48,32]当num_repeat=1
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
 
@@ -913,7 +940,11 @@ class WanS2V:
             n_prompt = self.sample_neg_prompt
 
         # process prompt
-        context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model) #list(1):[len,4096]
+        if profiler:
+            with profiler.track("text_encoding", "encode"):
+                context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model)
+        else:
+            context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model) #list(1):[len,4096]
         dataset_info = {}
 
         print("complete prepare conditional inputs")
@@ -959,39 +990,54 @@ class WanS2V:
                 max_seq_len = np.prod(target_shape) // 4
                 if self.kv_cache1 is None:
                     if offload_model or self.init_on_cpu:
-                        self.noise_model.to(self.device)
-                        self.vae.model.cpu()
-                        self.text_encoder.model.cpu()
-                        self.audio_encoder.model.cpu()
-                        torch.cuda.empty_cache()
+                        if profiler:
+                            with profiler.track("offload_dit_to_gpu", "offload"):
+                                self.noise_model.to(self.device)
+                                self.vae.model.cpu()
+                                self.text_encoder.model.cpu()
+                                self.audio_encoder.model.cpu()
+                                torch.cuda.empty_cache()
+                        else:
+                            self.noise_model.to(self.device)
+                            self.vae.model.cpu()
+                            self.text_encoder.model.cpu()
+                            self.audio_encoder.model.cpu()
+                            torch.cuda.empty_cache()
                     self.kv_cache1 = {}
                     
-                    if not self.offload_kv_cache:
-                        self.shared_cond_cache = []
-                        cond_device = f"cuda:{0}" if self.single_gpu else f"cuda:{0}"
-                        for _ in range(self.noise_model.num_layers):
-                            self.shared_cond_cache.append({
-                                "cond_k": torch.zeros([1, 2800, 40, 128], dtype=self.param_dtype, device=cond_device),
-                                "cond_v": torch.zeros([1, 2800, 40, 128], dtype=self.param_dtype, device=cond_device),
-                                "cond_end": torch.tensor([0], dtype=torch.long, device=cond_device)
-                            })
-                    else:
-                        self.shared_cond_cache = None
-                    
-                    for gpu_id in range(4):
-                        self._initialize_kv_cache(
+                    def _do_kv_cache_init():
+                        if not self.offload_kv_cache:
+                            self.shared_cond_cache = []
+                            cond_device = f"cuda:{0}" if self.single_gpu else f"cuda:{0}"
+                            for _ in range(self.noise_model.num_layers):
+                                self.shared_cond_cache.append({
+                                    "cond_k": torch.zeros([1, 2800, 40, 128], dtype=self.param_dtype, device=cond_device),
+                                    "cond_v": torch.zeros([1, 2800, 40, 128], dtype=self.param_dtype, device=cond_device),
+                                    "cond_end": torch.tensor([0], dtype=torch.long, device=cond_device)
+                                })
+                        else:
+                            self.shared_cond_cache = None
+
+                        for gpu_id in range(4):
+                            self._initialize_kv_cache(
+                                batch_size=1,
+                                dtype=self.param_dtype,
+                                device=f"cuda:{gpu_id+1}",
+                                gpu_id=gpu_id+1,
+                                kv_cache_size=max_seq_len
+                            )
+
+                        self._initialize_crossattn_cache(
                             batch_size=1,
                             dtype=self.param_dtype,
-                            device=f"cuda:{gpu_id+1}",
-                            gpu_id=gpu_id+1,
-                            kv_cache_size=max_seq_len
+                            device=self.device
                         )
 
-                    self._initialize_crossattn_cache(
-                        batch_size=1,
-                        dtype=self.param_dtype,
-                        device=self.device
-                    )
+                    if profiler:
+                        with profiler.track("kv_cache_init", "cache"):
+                            _do_kv_cache_init()
+                    else:
+                        _do_kv_cache_init()
 
 
                 #----------------------------------------------Step 2.2: prepare clip-level cond---------------------------------
@@ -1006,42 +1052,55 @@ class WanS2V:
                 input_motion_latents = motion_latents.clone()
 
                 if offload_model or self.init_on_cpu:
-                    self.noise_model.to(self.device)
-                    self.vae.model.cpu()
-                    torch.cuda.empty_cache()
+                    if profiler:
+                        with profiler.track(f"offload_dit_to_gpu_clip{r}", "offload"):
+                            self.noise_model.to(self.device)
+                            self.vae.model.cpu()
+                            torch.cuda.empty_cache()
+                    else:
+                        self.noise_model.to(self.device)
+                        self.vae.model.cpu()
+                        torch.cuda.empty_cache()
 
                 #-----------------------------------------------Temporal denoising loop in single clip---------------------------------
                 # 2.2.0 prefill cond caching
                 if r==0 or (r==1 and enable_online_decode):
-                    for gpu_id in range(4):
-                        self._move_kv_cache_to_working_gpu(gpu_id+1) # move to gpu0
+                    def _do_prefill_cond_cache():
+                        for gpu_id in range(4):
+                            self._move_kv_cache_to_working_gpu(gpu_id+1) # move to gpu0
 
-                        block_index = 0
-                        block_latents = clip_latents[0][:, block_index *
-                                        self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
-                        left_idx = block_index * (self.num_frames_per_block * 4)
-                        right_idx = (block_index+1) * (self.num_frames_per_block * 4)
-                        block_arg_c = {
-                            'context': context[0:1], #list(1) torch.Size([19, 4096])
-                            'seq_len': None,
-                            'cond_states': cond_latents[:,:,block_index * 
-                                            self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block],
-                            "motion_latents": input_motion_latents,
-                            'ref_latents': ref_latents,
-                            "audio_input": audio_input[..., left_idx:right_idx],
-                            "motion_frames": [self.motion_frames, lat_motion_frames],
-                            "drop_motion_frames": drop_first_motion and r == 0,
-                            "sink_flag": True,
-                        }
-                        timestep = torch.ones(
-                            [1, self.num_frames_per_block], device=self.device, dtype=self.param_dtype) * 0
-                        self.noise_model( #update clean kv cache
-                            [block_latents], t=timestep*0, **block_arg_c, 
-                            kv_cache=self.kv_cache1[str(gpu_id+1)], crossattn_cache=self.crossattn_cache,
-                            current_start=block_index * self.num_frames_per_block * frame_seq_length,
-                            current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length)
-                        
-                        self._move_kv_cache_to_working_gpu(gpu_id+1, gpu_id+1) # move to gpu0
+                            block_index = 0
+                            block_latents = clip_latents[0][:, block_index *
+                                            self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block] #[16,f,h,w]
+                            left_idx = block_index * (self.num_frames_per_block * 4)
+                            right_idx = (block_index+1) * (self.num_frames_per_block * 4)
+                            block_arg_c = {
+                                'context': context[0:1], #list(1) torch.Size([19, 4096])
+                                'seq_len': None,
+                                'cond_states': cond_latents[:,:,block_index *
+                                                self.num_frames_per_block:(block_index + 1) * self.num_frames_per_block],
+                                "motion_latents": input_motion_latents,
+                                'ref_latents': ref_latents,
+                                "audio_input": audio_input[..., left_idx:right_idx],
+                                "motion_frames": [self.motion_frames, lat_motion_frames],
+                                "drop_motion_frames": drop_first_motion and r == 0,
+                                "sink_flag": True,
+                            }
+                            timestep = torch.ones(
+                                [1, self.num_frames_per_block], device=self.device, dtype=self.param_dtype) * 0
+                            self.noise_model( #update clean kv cache
+                                [block_latents], t=timestep*0, **block_arg_c,
+                                kv_cache=self.kv_cache1[str(gpu_id+1)], crossattn_cache=self.crossattn_cache,
+                                current_start=block_index * self.num_frames_per_block * frame_seq_length,
+                                current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length)
+
+                            self._move_kv_cache_to_working_gpu(gpu_id+1, gpu_id+1) # move to gpu0
+
+                    if profiler:
+                        with profiler.track(f"prefill_cond_cache_clip{r}", "cache"):
+                            _do_prefill_cond_cache()
+                    else:
+                        _do_prefill_cond_cache()
 
 
                 num_blocks = target_shape[0] // self.num_frames_per_block
@@ -1080,22 +1139,76 @@ class WanS2V:
                         timestep = [t] * self.num_frames_per_block
                         timestep = torch.tensor(timestep).to(self.device).unsqueeze(0)
 
-                        self._move_kv_cache_to_working_gpu(i+1)# i+1 gpu -> 0
-                        noise_pred_cond = self.noise_model(
-                            [latent_model_input], t=timestep, **block_arg_c, 
+                        _dit_kwargs = dict(
+                            t=timestep, **block_arg_c,
                             kv_cache=self.kv_cache1[str(i+1)], crossattn_cache=self.crossattn_cache,
                             current_start=block_index * self.num_frames_per_block * frame_seq_length + r * num_blocks * self.num_frames_per_block * frame_seq_length,
                             current_end=(block_index + 1) * self.num_frames_per_block * frame_seq_length + r * num_blocks *self.num_frames_per_block * frame_seq_length,
                             mask=mask)
 
-                        noise_pred = [torch.cat(noise_pred_cond, dim=0)]
-                        self._move_kv_cache_to_working_gpu(i+1,i+1)# i+1 gpu -> 0
-                        temp_x0 = sample_scheduler.step(
-                            noise_pred[0].unsqueeze(0),# [16,f,h,w]
-                            t,
-                            latent_model_input.unsqueeze(0), #[1,16,f,h,w]
-                            return_dict=False,
-                            generator=seed_g)[0]
+                        if profiler:
+                            with profiler.track(f"kv_cache_to_gpu_clip{r}_block{block_index}_step{i}", "cache"):
+                                self._move_kv_cache_to_working_gpu(i+1)
+
+                            # Memory snapshot for first DiT forward
+                            _record_snapshot = (torch_trace and r == 0 and block_index == 0 and i == 0
+                                                and profile_output_dir)
+                            if _record_snapshot:
+                                torch.cuda.memory._record_memory_history(max_entries=100000)
+
+                            # Torch profiler Chrome trace for first clip, first block
+                            _export_trace = (torch_trace and r == 0 and block_index == 0
+                                             and profile_output_dir)
+                            if _export_trace:
+                                with torch.profiler.profile(
+                                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                                torch.profiler.ProfilerActivity.CUDA],
+                                    record_shapes=True, profile_memory=True, with_stack=True,
+                                ) as _prof:
+                                    with profiler.track(f"dit_forward_clip{r}_block{block_index}_step{i}", "dit"):
+                                        noise_pred_cond = self.noise_model(
+                                            [latent_model_input], **_dit_kwargs)
+                                _trace_path = os.path.join(profile_output_dir,
+                                                            f"dit_block{block_index}_step{i}_trace.json")
+                                _prof.export_chrome_trace(_trace_path)
+                                print(f"[PROFILE] Exported Chrome trace: {_trace_path}")
+                                print(_prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=15))
+                            else:
+                                with profiler.track(f"dit_forward_clip{r}_block{block_index}_step{i}", "dit"):
+                                    noise_pred_cond = self.noise_model(
+                                        [latent_model_input], **_dit_kwargs)
+
+                            if _record_snapshot:
+                                _snap_path = os.path.join(profile_output_dir, "dit_memory_snapshot.pickle")
+                                torch.cuda.memory._dump_snapshot(_snap_path)
+                                torch.cuda.memory._record_memory_history(enabled=None)
+                                print(f"[PROFILE] Memory snapshot saved: {_snap_path}")
+
+                            noise_pred = [torch.cat(noise_pred_cond, dim=0)]
+
+                            with profiler.track(f"kv_cache_offload_clip{r}_block{block_index}_step{i}", "cache"):
+                                self._move_kv_cache_to_working_gpu(i+1,i+1)
+
+                            with profiler.track(f"scheduler_step_clip{r}_block{block_index}_step{i}", "scheduler"):
+                                temp_x0 = sample_scheduler.step(
+                                    noise_pred[0].unsqueeze(0),
+                                    t,
+                                    latent_model_input.unsqueeze(0),
+                                    return_dict=False,
+                                    generator=seed_g)[0]
+                        else:
+                            self._move_kv_cache_to_working_gpu(i+1)# i+1 gpu -> 0
+                            noise_pred_cond = self.noise_model(
+                                [latent_model_input], **_dit_kwargs)
+
+                            noise_pred = [torch.cat(noise_pred_cond, dim=0)]
+                            self._move_kv_cache_to_working_gpu(i+1,i+1)# i+1 gpu -> 0
+                            temp_x0 = sample_scheduler.step(
+                                noise_pred[0].unsqueeze(0),# [16,f,h,w]
+                                t,
+                                latent_model_input.unsqueeze(0), #[1,16,f,h,w]
+                                return_dict=False,
+                                generator=seed_g)[0]
                         block_latents = temp_x0.squeeze(0) #[16,num_frames_per_block,h,w]
                     
                     clip_output[:, block_index * self.num_frames_per_block:(
@@ -1106,15 +1219,41 @@ class WanS2V:
                 if r == 0 and enable_online_decode:
                     if offload_model:
                         print(f"offloading model to cpu, please wait...")
-                        self.noise_model.cpu()
-                        self.vae.model.to(self.device)
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
+                        if profiler:
+                            with profiler.track(f"offload_dit_cpu_vae_gpu_clip{r}", "offload"):
+                                self.noise_model.cpu()
+                                self.vae.model.to(self.device)
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
+                        else:
+                            self.noise_model.cpu()
+                            self.vae.model.to(self.device)
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
                     ref_latents = clip_output.unsqueeze(0)[:, :, 0:1]
                     decode_latents = torch.cat(
                         [motion_latents, clip_output.unsqueeze(0)], dim=2
                     )
-                    image = torch.stack(self.vae.decode(decode_latents))
+                    if profiler:
+                        # Chrome trace for first VAE decode
+                        if torch_trace and profile_output_dir:
+                            pass  # os already imported at module level
+                            with torch.profiler.profile(
+                                activities=[torch.profiler.ProfilerActivity.CPU,
+                                            torch.profiler.ProfilerActivity.CUDA],
+                                record_shapes=True, profile_memory=True, with_stack=True,
+                            ) as _vae_prof:
+                                with profiler.track(f"vae_decode_online_clip{r}", "vae"):
+                                    image = torch.stack(self.vae.decode(decode_latents))
+                            _vae_trace = os.path.join(profile_output_dir, "vae_decode_online_trace.json")
+                            _vae_prof.export_chrome_trace(_vae_trace)
+                            print(f"[PROFILE] Exported VAE decode trace: {_vae_trace}")
+                            print(_vae_prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=15))
+                        else:
+                            with profiler.track(f"vae_decode_online_clip{r}", "vae"):
+                                image = torch.stack(self.vae.decode(decode_latents))
+                    else:
+                        image = torch.stack(self.vae.decode(decode_latents))
                     image = image[:, :, -(infer_frames):]
                     image = image[:, :, 3:]
 
@@ -1129,15 +1268,28 @@ class WanS2V:
                     videos_last_frames = videos_last_frames.to(
                         dtype=motion_latents.dtype, device=motion_latents.device
                     )
-                    motion_latents = torch.stack(
-                        self.vae.encode(videos_last_frames)
-                    ).type_as(clip_latents[0])
+                    if profiler:
+                        with profiler.track(f"vae_encode_motion_clip{r}", "vae"):
+                            motion_latents = torch.stack(
+                                self.vae.encode(videos_last_frames)
+                            ).type_as(clip_latents[0])
+                    else:
+                        motion_latents = torch.stack(
+                            self.vae.encode(videos_last_frames)
+                        ).type_as(clip_latents[0])
                     out.append(image.cpu())
                     if offload_model:
-                        self.vae.model.cpu()
-                        self.noise_model.to(self.device)
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
+                        if profiler:
+                            with profiler.track(f"offload_vae_cpu_dit_gpu_clip{r}", "offload"):
+                                self.vae.model.cpu()
+                                self.noise_model.to(self.device)
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
+                        else:
+                            self.vae.model.cpu()
+                            self.noise_model.to(self.device)
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
                 else:
                     clip_outputs.append(clip_output.detach().cpu())
 
@@ -1148,11 +1300,18 @@ class WanS2V:
                 print(
                     f"loading VAE to cuda for final decode of remaining clips"
                 )
-                self.kv_cache1 = None
-                # self.noise_model.cpu()
-                self.vae.model.to(self.device)
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                if profiler:
+                    with profiler.track("offload_for_final_decode", "offload"):
+                        self.kv_cache1 = None
+                        self.vae.model.to(self.device)
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                else:
+                    self.kv_cache1 = None
+                    # self.noise_model.cpu()
+                    self.vae.model.to(self.device)
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
 
             motion_latents_pp = motion_latents
             for clip_idx, clip_output_cpu in enumerate(clip_outputs):
@@ -1163,9 +1322,28 @@ class WanS2V:
                     [motion_latents_pp, clip_output.unsqueeze(0)], dim=2
                 )
 
-                image = torch.stack(self.vae.decode(decode_latents))
+                if profiler:
+                    # Chrome trace for first deferred VAE decode
+                    if torch_trace and clip_idx == 0 and profile_output_dir:
+                        pass  # os already imported at module level
+                        with torch.profiler.profile(
+                            activities=[torch.profiler.ProfilerActivity.CPU,
+                                        torch.profiler.ProfilerActivity.CUDA],
+                            record_shapes=True, profile_memory=True, with_stack=True,
+                        ) as _vae_prof:
+                            with profiler.track(f"vae_decode_deferred_clip{clip_idx}", "vae"):
+                                image = torch.stack(self.vae.decode(decode_latents))
+                        _vae_trace = os.path.join(profile_output_dir, "vae_decode_deferred_trace.json")
+                        _vae_prof.export_chrome_trace(_vae_trace)
+                        print(f"[PROFILE] Exported VAE decode trace: {_vae_trace}")
+                        print(_vae_prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=15))
+                    else:
+                        with profiler.track(f"vae_decode_deferred_clip{clip_idx}", "vae"):
+                            image = torch.stack(self.vae.decode(decode_latents))
+                else:
+                    image = torch.stack(self.vae.decode(decode_latents))
                 image = image[:, :, -(infer_frames):]
-                
+
                 if not enable_online_decode and clip_idx == 0:
                     image = image[:, :, 3:]
 
@@ -1180,9 +1358,15 @@ class WanS2V:
                 videos_last_frames = videos_last_frames.to(
                     dtype=motion_latents_pp.dtype, device=motion_latents_pp.device
                 )
-                motion_latents_pp = torch.stack(
-                    self.vae.encode(videos_last_frames)
-                ).type_as(clip_output)
+                if profiler:
+                    with profiler.track(f"vae_encode_motion_deferred_clip{clip_idx}", "vae"):
+                        motion_latents_pp = torch.stack(
+                            self.vae.encode(videos_last_frames)
+                        ).type_as(clip_output)
+                else:
+                    motion_latents_pp = torch.stack(
+                        self.vae.encode(videos_last_frames)
+                    ).type_as(clip_output)
                 out.append(image.cpu())
 
         videos = torch.cat(out, dim=2)
