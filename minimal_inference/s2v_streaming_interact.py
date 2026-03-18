@@ -350,6 +350,11 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Export torch.profiler Chrome traces and memory snapshots.")
+    parser.add_argument(
+        "--torch_profiler_tensorboard",
+        action="store_true",
+        default=False,
+        help="Run full torch.profiler over the pipeline and export TensorBoard logs for interactive exploration.")
     args = parser.parse_args()
 
     _validate_args(args)
@@ -611,7 +616,32 @@ def generate(args, training_settings):
             profile_output_dir=args.profile_output_dir,
         )
 
-        video, dataset_info = wan_s2v.generate(**_generate_kwargs)
+        if args.torch_profiler_tensorboard:
+            # Disable inner per-op torch traces — Kineto doesn't support nested profilers
+            _generate_kwargs["torch_trace"] = False
+            _tb_log_dir = os.path.join(args.profile_output_dir, "tb_profiler")
+            os.makedirs(_tb_log_dir, exist_ok=True)
+            _profile_suffix = f"_rank{rank}" if world_size > 1 else ""
+            _tb_prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                profile_memory=True,
+                with_stack=False,
+            )
+            _tb_prof.start()
+            video, dataset_info = wan_s2v.generate(**_generate_kwargs)
+            _tb_prof.stop()
+            _tb_trace_handler = torch.profiler.tensorboard_trace_handler(
+                _tb_log_dir, worker_name=f"worker{_profile_suffix}"
+            )
+            _tb_trace_handler(_tb_prof)
+            print(f"[PROFILE] TensorBoard profiler logs saved to {_tb_log_dir}")
+            print(f"[PROFILE] View with: tensorboard --logdir={_tb_log_dir}")
+        else:
+            video, dataset_info = wan_s2v.generate(**_generate_kwargs)
     else:
         assert False, "Only s2v is supported for now."
 

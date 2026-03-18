@@ -8,7 +8,9 @@ export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=OFF
 export ENABLE_COMPILE=false  # Disable torch.compile for accurate profiling
 
-mkdir -p profiling_output_multi_gpu
+RUN_DIR="profiling_output_multi_gpu/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RUN_DIR"
+echo "Profiling output: $RUN_DIR"
 
 CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
     --nproc_per_node=5 --master_port=29102 \
@@ -35,6 +37,6 @@ CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
     --ckpt_dir ckpt/Wan2.2-S2V-14B/ \
     --fp8 \
     --enable_profiling \
-    --profile_output_dir profiling_output_multi_gpu \
+    --profile_output_dir "$RUN_DIR" \
     --profile_num_clips 2 \
-    --torch_trace
+    --torch_profiler_tensorboard

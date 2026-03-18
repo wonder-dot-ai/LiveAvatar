@@ -6,9 +6,11 @@
 CUDA_VISIBLE_DEVICES=0
 export NCCL_DEBUG=WARN
 export NCCL_DEBUG_SUBSYS=OFF
-export ENABLE_COMPILE=false  # Disable torch.compile for accurate profiling granularity
+export ENABLE_COMPILE=true  # Keep torch.compile — only timing, no per-op profiling
 
-mkdir -p profiling_output
+RUN_DIR="profiling_output/$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RUN_DIR"
+echo "Profiling output: $RUN_DIR"
 
 CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
     --nproc_per_node=1 --master_port=29101 \
@@ -35,6 +37,5 @@ CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES torchrun \
     --ckpt_dir ckpt/Wan2.2-S2V-14B/ \
     --fp8 \
     --enable_profiling \
-    --profile_output_dir profiling_output \
-    --profile_num_clips 2 \
-    --torch_trace
+    --profile_output_dir "$RUN_DIR" \
+    --profile_num_clips 2
