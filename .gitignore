@@ -24,6 +24,7 @@ tests/
 infinite_generate_test.sh
 streaming_output_test.py
 examples/liuwei2.png
+profiling_output/
 
 
 # C extensions
@@ -150,6 +151,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.envrc
 
 # Spyder project settings
 .spyderproject
