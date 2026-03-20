@@ -286,41 +286,82 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 roped_key = causal_rope_apply(
                     k, grid_sizes, freqs).type_as(v)
                 seg_len_block = seg_idx[1]-seg_idx[0]
-                active_kv_cache_start = 0
-                if current_start >= kv_cache['k'].shape[1]:# for case current_start > kv_cache size, kv_rolling
-                    assert self.local_attn_size == -1, "local_attn_size should be -1 for streaming inference"
-                    current_start = current_start % kv_cache['k'].shape[1] 
-                    active_kv_cache_size = kv_cache['k'].shape[1]
-                    # active_cond_cache_size = seg_len_block//3 # only ref image, hard-code for case num_frames_per_block=3
-                    active_cond_cache_size = int(kv_cache["cond_end"])
-                else:
-                    active_kv_cache_size = current_start+seg_len_block
-                    if self.local_attn_size != -1:
-                        # hard-code for case num_frames_per_block=3
-                        active_kv_cache_start = max(0,active_kv_cache_size - self.local_attn_size * seg_len_block // 3)
-                    active_cond_cache_size = int(kv_cache["cond_end"])
 
-                kv_cache["k"][:, current_start:(current_start+seg_len_block)] = roped_key[:,seg_idx[0]:seg_idx[1]]
-                kv_cache["v"][:, current_start:(current_start+seg_len_block)] = v[:,seg_idx[0]:seg_idx[1]]
-                x = attention(
-                    q=roped_query[:,seg_idx[0]:seg_idx[1]],
-                    k=torch.cat(
-                                [
-                                kv_cache["k"][:, active_kv_cache_start:active_kv_cache_size],
-                                causal_rope_apply_cond(
-                                    kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
-                                    ).type_as(v)
-                                ],dim=1
-                                ),
-                    v=torch.cat(
-                                [
-                                kv_cache["v"][:, active_kv_cache_start:active_kv_cache_size],
-                                kv_cache["cond_v"][:, :active_cond_cache_size]
-                                ],dim=1
-                                ),
-                    k_lens=torch.tensor(active_kv_cache_size - active_kv_cache_start + active_cond_cache_size).repeat(b),
-                    window_size=self.window_size
-                    )
+                if isinstance(current_start, torch.Tensor):
+                    # --- Per-batch path (batched pipeline) ---
+                    active_cond_cache_size = int(kv_cache["cond_end"])
+                    kv_max = kv_cache['k'].shape[1]
+
+                    active_sizes = []
+                    for bi in range(b):
+                        cs = int(current_start[bi].item())
+                        if cs >= kv_max:
+                            cs = cs % kv_max
+                        kv_cache["k"][bi, cs:(cs+seg_len_block)] = roped_key[bi, seg_idx[0]:seg_idx[1]]
+                        kv_cache["v"][bi, cs:(cs+seg_len_block)] = v[bi, seg_idx[0]:seg_idx[1]]
+                        active_sizes.append(min(cs + seg_len_block, kv_max))
+
+                    max_active_size = max(active_sizes)
+
+                    cond_k_roped = causal_rope_apply_cond(
+                        kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
+                    ).type_as(v)
+
+                    k_cat = torch.cat([
+                        kv_cache["k"][:, :max_active_size],
+                        cond_k_roped
+                    ], dim=1)
+                    v_cat = torch.cat([
+                        kv_cache["v"][:, :max_active_size],
+                        kv_cache["cond_v"][:, :active_cond_cache_size]
+                    ], dim=1)
+
+                    k_lens = torch.tensor([
+                        active_sizes[bi] + active_cond_cache_size
+                        for bi in range(b)
+                    ], dtype=torch.int32, device=x.device)
+
+                    x = flash_attention(
+                        q=roped_query[:, seg_idx[0]:seg_idx[1]],
+                        k=k_cat, v=v_cat,
+                        k_lens=k_lens,
+                        window_size=self.window_size)
+                else:
+                    # --- Scalar path (original code, backward compatible) ---
+                    active_kv_cache_start = 0
+                    if current_start >= kv_cache['k'].shape[1]:# for case current_start > kv_cache size, kv_rolling
+                        assert self.local_attn_size == -1, "local_attn_size should be -1 for streaming inference"
+                        current_start = current_start % kv_cache['k'].shape[1]
+                        active_kv_cache_size = kv_cache['k'].shape[1]
+                        active_cond_cache_size = int(kv_cache["cond_end"])
+                    else:
+                        active_kv_cache_size = current_start+seg_len_block
+                        if self.local_attn_size != -1:
+                            # hard-code for case num_frames_per_block=3
+                            active_kv_cache_start = max(0,active_kv_cache_size - self.local_attn_size * seg_len_block // 3)
+                        active_cond_cache_size = int(kv_cache["cond_end"])
+
+                    kv_cache["k"][:, current_start:(current_start+seg_len_block)] = roped_key[:,seg_idx[0]:seg_idx[1]]
+                    kv_cache["v"][:, current_start:(current_start+seg_len_block)] = v[:,seg_idx[0]:seg_idx[1]]
+                    x = attention(
+                        q=roped_query[:,seg_idx[0]:seg_idx[1]],
+                        k=torch.cat(
+                                    [
+                                    kv_cache["k"][:, active_kv_cache_start:active_kv_cache_size],
+                                    causal_rope_apply_cond(
+                                        kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
+                                        ).type_as(v)
+                                    ],dim=1
+                                    ),
+                        v=torch.cat(
+                                    [
+                                    kv_cache["v"][:, active_kv_cache_start:active_kv_cache_size],
+                                    kv_cache["cond_v"][:, :active_cond_cache_size]
+                                    ],dim=1
+                                    ),
+                        k_lens=torch.tensor(active_kv_cache_size - active_kv_cache_start + active_cond_cache_size).repeat(b),
+                        window_size=self.window_size
+                        )
             elif seg_idx[2]-seg_idx[1] > 0: #prefill cond caching
                 roped_query = causal_rope_apply_cond(
                     q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
@@ -1133,16 +1174,50 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
 
-        self.pre_compute_freqs = rope_precompute( #可以做一点加速这里大概0.06秒，其中0.45秒是计算（cpu串行可以挪到gpu），分配内存0.15秒可以cache
-            x.detach().view(b, s, n, d), rollout_grid_sizes(grid_sizes,current_start // frame_seqlen), self.freqs, start=None )
-
         import random
-        relative_dist = random.randint(4, 30)
-        # relative_dist = 30
-        start_idx = 30-relative_dist
-        num_frames_cond_rollout = max(0, current_start // frame_seqlen - start_idx)
-        cond_pre_compute_freqs = rope_precompute( 
-            torch.empty(self.rope_cache['cond_shape']).type_as(x), rollout_grid_sizes(self.rope_cache['grid_sizes'],num_frames_cond_rollout), self.freqs, start=None )
+        if isinstance(current_start, torch.Tensor) and b > 1:
+            # Per-batch RoPE for batched pipeline
+            frame_seqlen_int = int(frame_seqlen)
+            freqs_list = []
+            cond_freqs_list = []
+            for bi in range(b):
+                cs_bi = int(current_start[bi].item())
+                frame_offset_bi = cs_bi // frame_seqlen_int
+
+                # Extract single-batch grid_sizes
+                gs_bi = [[g[bi:bi+1].clone() for g in group] for group in grid_sizes]
+                gs_bi_shifted = rollout_grid_sizes(gs_bi, frame_offset_bi)
+
+                x_bi = x[bi:bi+1].detach().view(1, s, n, d)
+                f_bi = rope_precompute(x_bi, gs_bi_shifted, self.freqs, start=None)
+                freqs_list.append(f_bi)
+
+                # Cond RoPE
+                relative_dist = random.randint(4, 30)
+                start_idx = 30 - relative_dist
+                num_frames_cond = max(0, frame_offset_bi - start_idx)
+                cond_shape_bi = list(self.rope_cache['cond_shape'])
+                cond_shape_bi[0] = 1
+                cond_gs_bi = [[g[bi:bi+1].clone() for g in group]
+                              for group in self.rope_cache['grid_sizes']]
+                cond_gs_shifted = rollout_grid_sizes(cond_gs_bi, num_frames_cond)
+                cf_bi = rope_precompute(
+                    torch.empty(cond_shape_bi).type_as(x),
+                    cond_gs_shifted, self.freqs, start=None)
+                cond_freqs_list.append(cf_bi)
+
+            self.pre_compute_freqs = torch.cat(freqs_list, dim=0)
+            cond_pre_compute_freqs = torch.cat(cond_freqs_list, dim=0)
+        else:
+            # Original scalar path
+            cs_scalar = int(current_start.item()) if isinstance(current_start, torch.Tensor) else current_start
+            self.pre_compute_freqs = rope_precompute(
+                x.detach().view(b, s, n, d), rollout_grid_sizes(grid_sizes, cs_scalar // frame_seqlen), self.freqs, start=None)
+            relative_dist = random.randint(4, 30)
+            start_idx = 30 - relative_dist
+            num_frames_cond_rollout = max(0, cs_scalar // frame_seqlen - start_idx)
+            cond_pre_compute_freqs = rope_precompute(
+                torch.empty(self.rope_cache['cond_shape']).type_as(x), rollout_grid_sizes(self.rope_cache['grid_sizes'], num_frames_cond_rollout), self.freqs, start=None)
         # print(f"current_grid_size:{rollout_grid_sizes(grid_sizes,current_start // frame_seqlen)}")
         # print(f"cond grid_size:{rollout_grid_sizes(self.rope_cache['grid_sizes'],num_frames_cond_rollout)}")
         mask_input = torch.zeros([1,x.shape[1]], dtype=torch.long, device=x.device)
