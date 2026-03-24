@@ -1,21 +1,15 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-# Batched TPP pipeline — single-GPU with batch=4 pipeline shift register.
+# Sequential denoising pipeline — single-GPU inference.
 import gc
 import logging
 import math
 import os
 import random
 import sys
-from copy import deepcopy
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
-import torchvision.transforms.functional as TF
-from decord import VideoReader
 from PIL import Image
-import torch.nn.functional as F
-from safetensors import safe_open
 from torchvision import transforms
 from tqdm import tqdm
 from peft import LoraConfig, get_peft_model
@@ -24,10 +18,6 @@ from .causal_audio_encoder import AudioEncoder
 from .causal_model_s2v import CausalWanModel_S2V
 from .wan_2_2.modules.t5 import T5EncoderModel
 from .wan_2_2.modules.vae2_1 import Wan2_1_VAE
-from .wan_2_2.utils.fm_solvers import (
-    FlowDPMSolverMultistepScheduler,
-)
-from .wan_2_2.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ...utils.load_weight_utils import load_state_dict
 
 
@@ -170,49 +160,15 @@ class WanS2V:
             self.text_encoder.model.cpu()
         return context, context_null
 
-    def read_last_n_frames(self, video_path, n_frames, target_fps=16, reverse=False):
-        vr = VideoReader(video_path)
-        original_fps = vr.get_avg_fps()
-        total_frames = len(vr)
-        interval = max(1, round(original_fps / target_fps))
-        required_span = (n_frames - 1) * interval
-        start_frame = max(0, total_frames - required_span - 1) if not reverse else 0
-        sampled_indices = []
-        for i in range(n_frames):
-            idx = start_frame + i * interval
-            if idx >= total_frames:
-                break
-            sampled_indices.append(idx)
-        return vr.get_batch(sampled_indices).asnumpy()
-
-    def load_pose_cond(self, pose_video, num_repeat, infer_frames, size):
+    def _encode_pose_cond(self, num_repeat, infer_frames, size):
+        """Encode zero pose conditioning (no pose video)."""
         HEIGHT, WIDTH = size
-        if pose_video is not None:
-            pose_seq = self.read_last_n_frames(
-                pose_video, n_frames=infer_frames * num_repeat,
-                target_fps=self.fps, reverse=True)
-            resize_op = transforms.Resize(min(HEIGHT, WIDTH))
-            crop_op = transforms.CenterCrop((HEIGHT, WIDTH))
-            cond_tensor = torch.from_numpy(pose_seq)
-            cond_tensor = cond_tensor.permute(0, 3, 1, 2) / 255.0 * 2 - 1.0
-            cond_tensor = crop_op(resize_op(cond_tensor)).permute(1, 0, 2, 3).unsqueeze(0)
-            padding_frame_num = num_repeat * infer_frames - cond_tensor.shape[2]
-            cond_tensor = torch.cat([
-                cond_tensor, -torch.ones([1, 3, padding_frame_num, HEIGHT, WIDTH])
-            ], dim=2)
-            cond_tensors = torch.chunk(cond_tensor, num_repeat, dim=2)
-        else:
-            cond_tensors = [-torch.ones([1, 3, infer_frames, HEIGHT, WIDTH])]
-
-        COND = []
-        for r in range(len(cond_tensors)):
-            cond = cond_tensors[r]
-            cond = torch.cat([cond[:, :, 0:1].repeat(1, 1, 1, 1, 1), cond], dim=2)
-            cond_lat = torch.stack(
-                self.vae.encode(cond.to(dtype=self.param_dtype,
-                                        device=self.device)))[:, :, 1:].cpu()
-            COND.append(cond_lat)
-        return COND
+        cond = -torch.ones([1, 3, infer_frames, HEIGHT, WIDTH])
+        cond = torch.cat([cond[:, :, 0:1], cond], dim=2)
+        cond_lat = torch.stack(
+            self.vae.encode(cond.to(dtype=self.param_dtype,
+                                    device=self.device)))[:, :, 1:].cpu()
+        return cond_lat
 
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size=13500):
         cache_device = "cpu" if self.offload_kv_cache else device
@@ -296,7 +252,6 @@ class WanS2V:
         ref_image_path=None,
         audio_path=None,
         num_repeat=1,
-        pose_video=None,
         max_area=720 * 1280,
         infer_frames=80,
         sampling_steps=4,
@@ -344,9 +299,7 @@ class WanS2V:
         videos_last_frames = motion_latents.detach()
         motion_latents = torch.stack(self.vae.encode(motion_latents))
 
-        COND = self.load_pose_cond(
-            pose_video=pose_video, num_repeat=num_repeat,
-            infer_frames=infer_frames, size=size)
+        cond_zero = self._encode_pose_cond(num_repeat, infer_frames, size)
 
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
 
@@ -397,7 +350,7 @@ class WanS2V:
                 # ---- 2.2 clip-level cond ----
                 left_idx = r * infer_frames
                 right_idx = r * infer_frames + infer_frames
-                cond_latents = COND[r] if pose_video else COND[0] * 0
+                cond_latents = cond_zero * 0
                 cond_latents = cond_latents.to(dtype=self.param_dtype, device=self.device)
                 audio_input = audio_emb[..., left_idx:right_idx]
                 input_motion_latents = motion_latents.clone()
