@@ -1,0 +1,6 @@
+# LiveAvatar S2V inference config
+# LoRA settings (must match the checkpoint)
+lora_rank: 128
+lora_alpha: 64.0
+lora_target_modules: "q,k,v,o,ffn.0,ffn.2"
+init_lora_weights: "kaiming"

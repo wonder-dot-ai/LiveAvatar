@@ -7,9 +7,8 @@ import warnings
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings('ignore')
 
+import yaml
 import torch
-import imageio
-import numpy as np
 
 
 def parse_args():
@@ -21,6 +20,7 @@ def parse_args():
     # Model
     p.add_argument("--ckpt_dir", default="ckpt/Wan2.2-S2V-14B/", help="Checkpoint directory")
     p.add_argument("--load_lora", default=None, help="LoRA checkpoint path")
+    p.add_argument("--config", default="configs/s2v_inference.yaml", help="Inference config (LoRA settings)")
     # Generation
     p.add_argument("--infer_frames", type=int, default=48, help="Frames per clip (must be 4n)")
     p.add_argument("--num_clip", type=int, default=1, help="Number of clips")
@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument("--pose_video", default=None, help="Pose driving video path")
     # Output
     p.add_argument("--output", default="output/result.mp4", help="Output video path")
-    p.add_argument("--fps", type=int, default=16, help="Output video FPS")
+    p.add_argument("--fps", type=int, default=25, help="Output video FPS")
     return p.parse_args()
 
 
@@ -63,11 +63,16 @@ def main():
 
     # Load LoRA if specified
     if args.load_lora:
-        print(f"Loading LoRA from {args.load_lora}")
+        with open(args.config) as f:
+            lora_cfg = yaml.safe_load(f)
+        print(f"Loading LoRA from {args.load_lora} (rank={lora_cfg['lora_rank']})")
         pipeline.noise_model = pipeline.add_lora_to_model(
             pipeline.noise_model,
-            pretrained_lora_path=args.load_lora,
-            load_only=True)
+            lora_rank=lora_cfg['lora_rank'],
+            lora_alpha=lora_cfg['lora_alpha'],
+            lora_target_modules=lora_cfg['lora_target_modules'],
+            init_lora_weights=lora_cfg['init_lora_weights'],
+            pretrained_lora_path=args.load_lora)
 
     # FP8 conversion
     if args.fp8:
@@ -106,11 +111,17 @@ def main():
 
     # Save video
     if video is not None:
-        video_np = ((video.clamp(-1, 1) + 1) / 2 * 255).byte()
-        video_np = video_np.permute(1, 2, 3, 0).cpu().numpy()
+        from liveavatar.models.wan.wan_2_2.utils.utils import save_video, merge_video_audio
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-        imageio.mimwrite(args.output, video_np, fps=args.fps, codec="libx264")
-        print(f"Saved: {args.output} ({video_np.shape[0]} frames, {video_np.shape[1]}x{video_np.shape[2]})")
+        save_video(
+            tensor=video[None],
+            save_file=args.output,
+            fps=args.fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1))
+        merge_video_audio(video_path=args.output, audio_path=args.audio)
+        print(f"Saved: {args.output}")
     else:
         print("No video generated.")
 

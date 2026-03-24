@@ -34,7 +34,7 @@ profiling_output/
 .Python
 build/
 develop-eggs/
-dist/
+dist/F
 downloads/
 eggs/
 .eggs/

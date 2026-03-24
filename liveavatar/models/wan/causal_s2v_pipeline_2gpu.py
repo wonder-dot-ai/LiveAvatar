@@ -7,7 +7,7 @@ import os
 import random
 import sys
 from copy import deepcopy
-import time
+
 import numpy as np
 import torch
 import torch.cuda.amp as amp
@@ -75,7 +75,9 @@ class WanS2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
         self.motion_frames = config.transformer.motion_frames
-        self.drop_first_motion = config.drop_first_motion
+        # config.drop_first_motion is True (training augmentation), but at inference
+        # we keep motion frames so the first clip stays faithful to the reference image
+        self.drop_first_motion = False
         self.fps = config.sample_fps
         self.audio_sample_m = 0
 
@@ -213,35 +215,80 @@ class WanS2V:
         return COND
 
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size=13500):
-        """Initialize a single KV cache with batch_size pipeline stages."""
-        kv_cache = []
         cache_device = "cpu" if self.offload_kv_cache else device
-        for _ in range(self.noise_model.num_layers):
-            layer_cache = {
-                "k": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=cache_device),
-                "v": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=cache_device),
-                "cond_k": torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=cache_device),
-                "cond_v": torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=cache_device),
-                "cond_end": torch.tensor([0], dtype=torch.long, device=cache_device),
-            }
-            kv_cache.append(layer_cache)
-        self.kv_cache = kv_cache
+        self.kv_cache = [{
+            "k": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=cache_device),
+            "v": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=cache_device),
+            "cond_k": torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=cache_device),
+            "cond_v": torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=cache_device),
+            "cond_end": torch.tensor([0], dtype=torch.long, device=cache_device),
+        } for _ in range(self.noise_model.num_layers)]
 
     def _move_kv_cache_to_device(self, device):
-        """Move the entire KV cache to the specified device."""
         for layer in self.kv_cache:
             for key in ["k", "v", "cond_k", "cond_v", "cond_end"]:
                 layer[key] = layer[key].to(device)
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
-        crossattn_cache = []
-        for _ in range(self.noise_model.num_layers):
-            crossattn_cache.append({
-                "k": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
-                "is_init": False
-            })
-        self.crossattn_cache = crossattn_cache
+        self.crossattn_cache = [{
+            "k": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
+            "v": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
+            "is_init": False,
+        } for _ in range(self.noise_model.num_layers)]
+
+    def _prefill_batch1(self, block_latents, cond, audio, context,
+                        motion_latents, ref_latents, motion_frames,
+                        lat_motion_frames, drop_motion, nfpb, frame_seq_length,
+                        num_steps):
+        """Run prefill with batch=1, then broadcast cond cache to all pipeline slots.
+
+        The motioner hardcodes batch=1 for rope cache shapes, so prefill must
+        run at batch=1. Results are then copied to all num_steps batch slots.
+        """
+        # Slice batch=1 views from the full caches
+        prefill_kv = [{
+            "k": layer["k"][0:1], "v": layer["v"][0:1],
+            "cond_k": layer["cond_k"][0:1], "cond_v": layer["cond_v"][0:1],
+            "cond_end": layer["cond_end"],
+        } for layer in self.kv_cache]
+        prefill_crossattn = [{
+            "k": layer["k"][0:1], "v": layer["v"][0:1],
+            "is_init": layer["is_init"],
+        } for layer in self.crossattn_cache]
+
+        if self.offload_kv_cache:
+            self._move_kv_cache_to_device(self.device)
+
+        timestep_zero = torch.zeros([1, nfpb], device=self.device, dtype=self.param_dtype)
+        self.noise_model(
+            [block_latents],
+            t=timestep_zero,
+            context=context[0:1],
+            seq_len=None,
+            cond_states=cond,
+            motion_latents=motion_latents,
+            ref_latents=ref_latents,
+            audio_input=audio,
+            motion_frames=[motion_frames, lat_motion_frames],
+            drop_motion_frames=drop_motion,
+            sink_flag=True,
+            kv_cache=prefill_kv,
+            crossattn_cache=prefill_crossattn,
+            current_start=0,
+            current_end=nfpb * frame_seq_length)
+
+        # Broadcast to all batch slots
+        for li in range(len(self.kv_cache)):
+            for key in ["k", "v", "cond_k", "cond_v"]:
+                self.kv_cache[li][key][:] = prefill_kv[li][key]
+            self.kv_cache[li]["cond_end"] = prefill_kv[li]["cond_end"]
+        for li in range(len(self.crossattn_cache)):
+            self.crossattn_cache[li]["k"] = prefill_crossattn[li]["k"].expand(num_steps, -1, -1, -1).contiguous()
+            self.crossattn_cache[li]["v"] = prefill_crossattn[li]["v"].expand(num_steps, -1, -1, -1).contiguous()
+            self.crossattn_cache[li]["is_init"] = prefill_crossattn[li]["is_init"]
+
+        if self.offload_kv_cache:
+            self._move_kv_cache_to_device("cpu")
 
     def generate(
         self,
@@ -262,9 +309,9 @@ class WanS2V:
         torch_trace=False,
         profile_output_dir=None,
     ):
-        num_steps = sampling_steps  # pipeline depth (= number of denoising steps)
+        num_steps = sampling_steps  # pipeline depth = number of denoising steps
 
-        # ---- Step 1: prepare conditional inputs ----
+        # ---- 1. Prepare conditional inputs ----
         ref_image = np.array(Image.open(ref_image_path).convert('RGB'))
         HEIGHT, WIDTH = self.get_size_less_than_area(
             ref_image.shape[0], ref_image.shape[1], target_area=max_area)
@@ -274,7 +321,6 @@ class WanS2V:
         crop_op = transforms.CenterCrop((HEIGHT, WIDTH))
         tensor_trans = transforms.ToTensor()
 
-        # Audio
         self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
         self.audio_encoder.model.requires_grad_(False)
         self.audio_encoder.model.eval()
@@ -312,7 +358,7 @@ class WanS2V:
         sample_scheduler = FlowMatchEulerDiscreteScheduler(
             num_train_timesteps=self.num_train_timesteps, shift=3)
 
-        # ---- Step 2: generate ----
+        # ---- 2. Generate clips ----
         with torch.amp.autocast('cuda', dtype=self.param_dtype), torch.no_grad():
             out = []
             clip_outputs = []
@@ -320,23 +366,22 @@ class WanS2V:
             active_nr = min(max_repeat, num_repeat)
 
             for r in range(active_nr):
-                # ---- 2.1 clip-level init ----
+                # ---- 2.1 clip-level setup ----
                 seed_g = torch.Generator(device=self.device)
                 seed_g.manual_seed(seed + r)
 
                 lat_target_frames = (infer_frames + 3 + self.motion_frames) // 4 - lat_motion_frames
                 target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
                 frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
-                nfpb = self.num_frames_per_block  # 3
+                nfpb = self.num_frames_per_block
                 num_blocks = target_shape[0] // nfpb
                 bsl = nfpb * frame_seq_length  # tokens per block in KV cache
                 max_seq_len = np.prod(target_shape) // 4
 
-                # Generate all block noise upfront
                 clip_noise = torch.randn(
                     16, target_shape[0], target_shape[1], target_shape[2],
                     dtype=self.param_dtype, device=self.device, generator=seed_g)
-                clip_output = torch.zeros_like(clip_noise)  # [16, f, h, w]
+                clip_output = torch.zeros_like(clip_noise)
 
                 if self.kv_cache is None:
                     if offload_model:
@@ -346,23 +391,15 @@ class WanS2V:
                         self.audio_encoder.model.cpu()
                         torch.cuda.empty_cache()
 
-                    self._initialize_kv_cache(
-                        batch_size=num_steps,
-                        dtype=self.param_dtype,
-                        device=self.device,
-                        kv_cache_size=max_seq_len)
-                    self._initialize_crossattn_cache(
-                        batch_size=num_steps,
-                        dtype=self.param_dtype,
-                        device=self.device)
+                    self._initialize_kv_cache(num_steps, self.param_dtype, self.device, max_seq_len)
+                    self._initialize_crossattn_cache(num_steps, self.param_dtype, self.device)
 
-                # ---- 2.2 prepare clip-level cond ----
-                with torch.no_grad():
-                    left_idx = r * infer_frames
-                    right_idx = r * infer_frames + infer_frames
-                    cond_latents = COND[r] if pose_video else COND[0] * 0
-                    cond_latents = cond_latents.to(dtype=self.param_dtype, device=self.device)
-                    audio_input = audio_emb[..., left_idx:right_idx]
+                # ---- 2.2 clip-level cond ----
+                left_idx = r * infer_frames
+                right_idx = r * infer_frames + infer_frames
+                cond_latents = COND[r] if pose_video else COND[0] * 0
+                cond_latents = cond_latents.to(dtype=self.param_dtype, device=self.device)
+                audio_input = audio_emb[..., left_idx:right_idx]
                 input_motion_latents = motion_latents.clone()
 
                 if offload_model:
@@ -370,189 +407,108 @@ class WanS2V:
                     self.vae.model.cpu()
                     torch.cuda.empty_cache()
 
-                # ---- 2.2.0 prefill cond caching ----
+                # ---- 2.3 prefill cond cache ----
                 if r == 0 or (r == 1 and enable_online_decode):
-                    # Prefill: all batch elements at current_start=0, same block
-                    block_index = 0
-                    block_latents_prefill = clip_noise[:, block_index * nfpb:(block_index + 1) * nfpb]
-                    left_a = block_index * (nfpb * 4)
-                    right_a = (block_index + 1) * (nfpb * 4)
-                    # Expand for batch=num_steps
-                    prefill_x = [block_latents_prefill] * num_steps
-                    prefill_cond = cond_latents[:, :, block_index * nfpb:(block_index + 1) * nfpb]
-                    prefill_cond_batch = [prefill_cond.squeeze(0)] * num_steps
-                    prefill_audio = audio_input[..., left_a:right_a].expand(num_steps, -1, -1, -1)
-                    prefill_context = context[0:1] * num_steps
-                    prefill_ref = ref_latents.expand(num_steps, -1, -1, -1, -1)
-                    prefill_motion = input_motion_latents.expand(num_steps, -1, -1, -1, -1)
+                    self._prefill_batch1(
+                        block_latents=clip_noise[:, :nfpb],
+                        cond=cond_latents[:, :, :nfpb],
+                        audio=audio_input[..., :nfpb * 4],
+                        context=context,
+                        motion_latents=input_motion_latents,
+                        ref_latents=ref_latents,
+                        motion_frames=self.motion_frames,
+                        lat_motion_frames=lat_motion_frames,
+                        drop_motion=self.drop_first_motion and r == 0,
+                        nfpb=nfpb,
+                        frame_seq_length=frame_seq_length,
+                        num_steps=num_steps)
 
-                    timestep_zero = torch.zeros(
-                        [num_steps, nfpb], device=self.device, dtype=self.param_dtype)
-
-                    if self.offload_kv_cache:
-                        self._move_kv_cache_to_device(self.device)
-
-                    self.noise_model(
-                        prefill_x,
-                        t=timestep_zero,
-                        context=prefill_context,
-                        seq_len=None,
-                        cond_states=prefill_cond_batch,
-                        motion_latents=prefill_motion,
-                        ref_latents=prefill_ref,
-                        audio_input=prefill_audio,
-                        motion_frames=[self.motion_frames, lat_motion_frames],
-                        drop_motion_frames=(self.drop_first_motion and r == 0),
-                        sink_flag=True,
-                        kv_cache=self.kv_cache,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=0,
-                        current_end=nfpb * frame_seq_length)
-
-                    if self.offload_kv_cache:
-                        self._move_kv_cache_to_device("cpu")
-
-                # ---- 2.3 setup scheduler ----
+                # ---- 2.4 setup scheduler ----
                 if getattr(self, '_sampler_timesteps', None) is None:
                     sample_scheduler.set_timesteps(sampling_steps, device=self.device)
                     self._sampler_timesteps = sample_scheduler.timesteps
                     self._sampler_sigmas = sample_scheduler.sigmas
 
-                timesteps = self._sampler_timesteps  # e.g., [750, 500, 250, 0]
+                timesteps = self._sampler_timesteps
 
-                # ---- 2.4 pipeline shift register denoising ----
-                total_iters = num_blocks + num_steps - 1
-                pipeline_latents = [None] * num_steps
-                pipeline_block_idx = [-1] * num_steps
-                # Dummy noise for inactive slots
+                # ---- 2.5 precompute per-iteration constants ----
+                # Timestep tensor: each row is one pipeline stage's timestep repeated nfpb times
+                batch_t = torch.stack([
+                    timesteps[i].expand(nfpb) for i in range(num_steps)
+                ])  # [num_steps, nfpb]
+
+                batch_context = context[0:1] * num_steps
+                batch_ref = ref_latents.expand(num_steps, -1, -1, -1, -1)
+                batch_motion = input_motion_latents.expand(num_steps, -1, -1, -1, -1)
+
                 dummy_noise = torch.zeros(
                     16, nfpb, target_shape[1], target_shape[2],
                     dtype=self.param_dtype, device=self.device)
 
-                for iter_idx in tqdm(range(total_iters), desc=f"clip {r}"):
-                    # Collect completed block from last slot
-                    if (pipeline_latents[num_steps - 1] is not None
-                            and pipeline_block_idx[num_steps - 1] >= 0):
-                        bi = pipeline_block_idx[num_steps - 1]
-                        clip_output[:, bi * nfpb:(bi + 1) * nfpb] = pipeline_latents[num_steps - 1]
+                # ---- 2.6 denoising ----
+                clip_base = r * num_blocks * bsl
+                current_start_base = clip_base
 
-                    # Shift pipeline
-                    for i in range(num_steps - 1, 0, -1):
-                        pipeline_latents[i] = pipeline_latents[i - 1]
-                        pipeline_block_idx[i] = pipeline_block_idx[i - 1]
+                for block_index in tqdm(range(num_blocks), desc=f"clip {r}"):
+                    block_latents = clip_noise[:, block_index * nfpb:(block_index + 1) * nfpb]
+                    la = block_index * (nfpb * 4)
+                    ra = (block_index + 1) * (nfpb * 4)
+                    cs = block_index * bsl + clip_base
+                    ce = (block_index + 1) * bsl + clip_base
 
-                    # Insert new noise block into slot 0
-                    new_block_idx = iter_idx
-                    if new_block_idx < num_blocks:
-                        pipeline_latents[0] = clip_noise[:, new_block_idx * nfpb:(new_block_idx + 1) * nfpb]
-                        pipeline_block_idx[0] = new_block_idx
-                    else:
-                        pipeline_latents[0] = dummy_noise
-                        pipeline_block_idx[0] = -1
+                    sample_scheduler.timesteps = self._sampler_timesteps
+                    sample_scheduler.sigmas = self._sampler_sigmas
+                    sample_scheduler._step_index = 0
+                    sample_scheduler._begin_index = 0
 
-                    # Build batched inputs
-                    batch_x = [pipeline_latents[i] for i in range(num_steps)]
+                    for step_i, t in enumerate(timesteps):
+                        if self.offload_kv_cache:
+                            self._move_kv_cache_to_device(self.device)
 
-                    batch_t = torch.stack([
-                        torch.tensor([timesteps[i].item()] * nfpb,
-                                     device=self.device, dtype=self.param_dtype)
-                        for i in range(num_steps)
-                    ])  # [num_steps, nfpb]
+                        # Use the step_i-th batch slot's KV cache
+                        step_kv = [{
+                            "k": layer["k"][step_i:step_i+1],
+                            "v": layer["v"][step_i:step_i+1],
+                            "cond_k": layer["cond_k"][step_i:step_i+1],
+                            "cond_v": layer["cond_v"][step_i:step_i+1],
+                            "cond_end": layer["cond_end"],
+                        } for layer in self.kv_cache]
+                        step_crossattn = [{
+                            "k": layer["k"][step_i:step_i+1],
+                            "v": layer["v"][step_i:step_i+1],
+                            "is_init": layer["is_init"],
+                        } for layer in self.crossattn_cache]
 
-                    # Per-batch current_start (in KV cache token units)
-                    # Each slot has processed a different number of blocks
-                    batch_current_start = torch.tensor([
-                        max(0, pipeline_block_idx[i]) * bsl
-                        + r * num_blocks * bsl
-                        for i in range(num_steps)
-                    ], device=self.device, dtype=torch.long)
+                        noise_pred = self.noise_model(
+                            [block_latents],
+                            t=t.unsqueeze(0).expand(1, nfpb),
+                            context=context[0:1],
+                            seq_len=None,
+                            cond_states=cond_latents[:, :, block_index * nfpb:(block_index + 1) * nfpb],
+                            motion_latents=input_motion_latents,
+                            ref_latents=ref_latents,
+                            audio_input=audio_input[..., la:ra],
+                            motion_frames=[self.motion_frames, lat_motion_frames],
+                            drop_motion_frames=(self.drop_first_motion and r == 0),
+                            kv_cache=step_kv,
+                            crossattn_cache=step_crossattn,
+                            current_start=cs,
+                            current_end=ce)
 
-                    batch_current_end = torch.tensor([
-                        (max(0, pipeline_block_idx[i]) + 1) * bsl
-                        + r * num_blocks * bsl
-                        for i in range(num_steps)
-                    ], device=self.device, dtype=torch.long)
+                        if self.offload_kv_cache:
+                            self._move_kv_cache_to_device("cpu")
 
-                    # Per-batch audio slices
-                    audio_slices = []
-                    for i in range(num_steps):
-                        bi = max(0, pipeline_block_idx[i])
-                        la = bi * (nfpb * 4)
-                        ra = (bi + 1) * (nfpb * 4)
-                        audio_slices.append(audio_input[0:1, ..., la:ra])  # [1, ...]
-                    batch_audio = torch.cat(audio_slices, dim=0)  # [num_steps, ...]
+                        block_latents = sample_scheduler.step(
+                            noise_pred[0].unsqueeze(0),
+                            t,
+                            block_latents.unsqueeze(0),
+                            return_dict=False,
+                            generator=seed_g
+                        )[0].squeeze(0)
 
-                    # Per-batch cond_states
-                    cond_slices = []
-                    for i in range(num_steps):
-                        bi = max(0, pipeline_block_idx[i])
-                        cond_slices.append(
-                            cond_latents[:, :, bi * nfpb:(bi + 1) * nfpb].squeeze(0))
-                    # batch_cond is a list of tensors for the model
+                    clip_output[:, block_index * nfpb:(block_index + 1) * nfpb] = block_latents
 
-                    # Context, ref, motion: expand to batch
-                    batch_context = context[0:1] * num_steps
-                    batch_ref = ref_latents.expand(num_steps, -1, -1, -1, -1)
-                    batch_motion = input_motion_latents.expand(num_steps, -1, -1, -1, -1)
-
-                    # Move KV cache to GPU if offloaded
-                    if self.offload_kv_cache:
-                        self._move_kv_cache_to_device(self.device)
-
-                    # Batched DiT forward
-                    noise_pred_list = self.noise_model(
-                        batch_x,
-                        t=batch_t,
-                        context=batch_context,
-                        seq_len=None,
-                        cond_states=cond_slices,
-                        motion_latents=batch_motion,
-                        ref_latents=batch_ref,
-                        audio_input=batch_audio,
-                        motion_frames=[self.motion_frames, lat_motion_frames],
-                        drop_motion_frames=(self.drop_first_motion and r == 0),
-                        kv_cache=self.kv_cache,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=batch_current_start,
-                        current_end=batch_current_end)
-
-                    if self.offload_kv_cache:
-                        self._move_kv_cache_to_device("cpu")
-
-                    # Per-slot scheduler step
-                    for i in range(num_steps):
-                        if pipeline_block_idx[i] >= 0:
-                            noise_pred_i = torch.cat([noise_pred_list[i]], dim=0)
-                            sample_scheduler.timesteps = self._sampler_timesteps
-                            sample_scheduler.sigmas = self._sampler_sigmas
-                            sample_scheduler._step_index = i
-                            sample_scheduler._begin_index = 0
-                            pipeline_latents[i] = sample_scheduler.step(
-                                noise_pred_i.unsqueeze(0),
-                                timesteps[i],
-                                pipeline_latents[i].unsqueeze(0),
-                                return_dict=False,
-                                generator=seed_g
-                            )[0].squeeze(0)
-
-                # Collect final blocks still in pipeline after loop ends
-                for i in range(num_steps):
-                    if pipeline_block_idx[i] >= 0 and pipeline_block_idx[i] < num_blocks:
-                        # Only slot num_steps-1 was collected in loop;
-                        # but after the loop, slots 0..num_steps-2 may have uncollected blocks
-                        # Actually, the last iteration's slot num_steps-1 was collected at top of next iter.
-                        # But there is no next iter. So we need to collect what's left.
-                        pass
-
-                # The loop collects slot[num_steps-1] at the START of each iteration.
-                # After the last iteration, slot[num_steps-1] has the last block.
-                # We need one more collection:
-                if (pipeline_latents[num_steps - 1] is not None
-                        and pipeline_block_idx[num_steps - 1] >= 0):
-                    bi = pipeline_block_idx[num_steps - 1]
-                    clip_output[:, bi * nfpb:(bi + 1) * nfpb] = pipeline_latents[num_steps - 1]
-
-                # ---- 2.5 clip postprocess ----
+                # ---- 2.7 clip postprocess ----
                 if r == 0 and enable_online_decode:
                     if offload_model:
                         self.noise_model.cpu()
@@ -585,7 +541,7 @@ class WanS2V:
                 else:
                     clip_outputs.append(clip_output.detach().cpu())
 
-        # ---- Step 3: deferred VAE decode ----
+        # ---- 3. Deferred VAE decode ----
         print(f"complete full-sequence generation")
         if clip_outputs:
             if offload_model:

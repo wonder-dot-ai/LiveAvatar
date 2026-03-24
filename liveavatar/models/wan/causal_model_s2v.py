@@ -792,7 +792,9 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 residual_out = residual_out.sum(dim=0, keepdim=True)
                 residual_out = rearrange(
                     residual_out, "b t h w c -> b (t h w) c")
-            elif num_actors > 1:
+            elif num_actors > 1 and num_actors != hidden_states.shape[0]:
+                # Multi-actor SAM2 case requires a mask; batched pipeline
+                # (num_actors == batch_size) is fine without one.
                 assert False, "num_actors should be equal to num_mask, but no mask is provided."
             
             hidden_states[:, :self.
@@ -1198,7 +1200,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 num_frames_cond = max(0, frame_offset_bi - start_idx)
                 cond_shape_bi = list(self.rope_cache['cond_shape'])
                 cond_shape_bi[0] = 1
-                cond_gs_bi = [[g[bi:bi+1].clone() for g in group]
+                cond_gs_bi = [[g[0:1].clone() for g in group]
                               for group in self.rope_cache['grid_sizes']]
                 cond_gs_shifted = rollout_grid_sizes(cond_gs_bi, num_frames_cond)
                 cf_bi = rope_precompute(
@@ -1285,13 +1287,15 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             self.pre_compute_freqs, _ = pad_chunk(self.pre_compute_freqs, model_sp_size, dim=1)
 
         # arguments
+        # seq_lens is uniform across batch (same resolution); use scalar for
+        # downstream .repeat() calls that expect int
         kwargs = dict(
             e=e0,
-            seq_lens=seq_lens,
+            seq_lens=seq_lens[0],
             grid_sizes=grid_sizes,
             freqs=self.pre_compute_freqs,
             context=context,
-            context_lens=context_lens,        
+            context_lens=context_lens,
             block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
