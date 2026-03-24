@@ -160,16 +160,6 @@ class WanS2V:
             self.text_encoder.model.cpu()
         return context, context_null
 
-    def _encode_pose_cond(self, num_repeat, infer_frames, size):
-        """Encode zero pose conditioning (no pose video)."""
-        HEIGHT, WIDTH = size
-        cond = -torch.ones([1, 3, infer_frames, HEIGHT, WIDTH])
-        cond = torch.cat([cond[:, :, 0:1], cond], dim=2)
-        cond_lat = torch.stack(
-            self.vae.encode(cond.to(dtype=self.param_dtype,
-                                    device=self.device)))[:, :, 1:].cpu()
-        return cond_lat
-
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size=13500):
         cache_device = "cpu" if self.offload_kv_cache else device
         self.kv_cache = [{
@@ -299,8 +289,6 @@ class WanS2V:
         videos_last_frames = motion_latents.detach()
         motion_latents = torch.stack(self.vae.encode(motion_latents))
 
-        cond_zero = self._encode_pose_cond(num_repeat, infer_frames, size)
-
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
 
         if n_prompt == "":
@@ -350,8 +338,9 @@ class WanS2V:
                 # ---- 2.2 clip-level cond ----
                 left_idx = r * infer_frames
                 right_idx = r * infer_frames + infer_frames
-                cond_latents = cond_zero * 0
-                cond_latents = cond_latents.to(dtype=self.param_dtype, device=self.device)
+                cond_latents = torch.zeros(
+                    1, 16, target_shape[0], target_shape[1], target_shape[2],
+                    dtype=self.param_dtype, device=self.device)
                 audio_input = audio_emb[..., left_idx:right_idx]
                 input_motion_latents = motion_latents.clone()
 
