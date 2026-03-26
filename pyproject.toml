@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liveavatar-nari"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "Pillow",
+    "torchvision",
+    "tqdm",
+    "safetensors",
+    "diffusers>=0.37",
+    "pyyaml",
+    "librosa",
+    "einops",
+    "ftfy",
+    "regex",
+]
+
+[project.optional-dependencies]
+lora = ["peft>=0.10"]
+
+[project.scripts]
+liveavatar-infer = "liveavatar_nari.cli.inference:main"
+
+[tool.setuptools.packages.find]
+include = ["liveavatar_nari*"]
