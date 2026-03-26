@@ -34,8 +34,6 @@ def parse_args():
                     help="Offload models to CPU between stages")
     p.add_argument("--offload_kv_cache", action="store_true",
                     help="Offload KV cache to CPU between forward passes")
-    p.add_argument("--enable_online_decode", action="store_true",
-                    help="Online VAE decode after clip 0")
     # Output
     p.add_argument("--output", default="output/result.mp4", help="Output video path")
     p.add_argument("--fps", type=int, default=25, help="Output video FPS")
@@ -103,7 +101,6 @@ def main():
         seed=args.seed,
         n_prompt=args.n_prompt,
         offload_model=args.offload_model,
-        enable_online_decode=args.enable_online_decode,
     )
 
     # Save video

@@ -12,7 +12,7 @@ CUDA_VISIBLE_DEVICES=0 python minimal_inference/s2v_2gpu.py \
     --fp8 \
     --offload_model True \
     --infer_frames 48 \
-    --num_clip 1 \
+    --num_clip 10 \
     --sample_steps 4 \
     --seed 4200 \
     --output output/result_2gpu.mp4

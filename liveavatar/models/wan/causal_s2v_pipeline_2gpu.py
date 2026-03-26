@@ -182,16 +182,13 @@ class WanS2V:
             "is_init": False,
         } for _ in range(self.noise_model.num_layers)]
 
-    def _prefill_batch1(self, block_latents, cond, audio, context,
-                        motion_latents, ref_latents, motion_frames,
-                        lat_motion_frames, drop_motion, nfpb, frame_seq_length,
-                        num_steps):
-        """Run prefill with batch=1, then broadcast cond cache to all pipeline slots.
+    def _prefill_cond_cache(self, context, motion_latents, ref_latents,
+                           lat_motion_frames, nfpb, frame_seq_length, num_steps):
+        """Cache conditioning (ref, motion, text) into KV cache, broadcast to all slots.
 
-        The motioner hardcodes batch=1 for rope cache shapes, so prefill must
-        run at batch=1. Results are then copied to all num_steps batch slots.
+        The model's _forward_sink requires block_latents, cond, and audio in its
+        signature, but discards their values. We pass zeros for those.
         """
-        # Slice batch=1 views from the full caches
         prefill_kv = [{
             "k": layer["k"][0:1], "v": layer["v"][0:1],
             "cond_k": layer["cond_k"][0:1], "cond_v": layer["cond_v"][0:1],
@@ -205,33 +202,34 @@ class WanS2V:
         if self.offload_kv_cache:
             self._move_kv_cache_to_device(self.device)
 
-        timestep_zero = torch.zeros([1, nfpb], device=self.device, dtype=self.param_dtype)
-        self.noise_model(
-            [block_latents],
-            t=timestep_zero,
-            context=context[0:1],
-            seq_len=None,
-            cond_states=cond,
-            motion_latents=motion_latents,
-            ref_latents=ref_latents,
-            audio_input=audio,
-            motion_frames=[motion_frames, lat_motion_frames],
-            drop_motion_frames=drop_motion,
-            sink_flag=True,
-            kv_cache=prefill_kv,
-            crossattn_cache=prefill_crossattn,
-            current_start=0,
-            current_end=nfpb * frame_seq_length)
+        # Dummies — required by model signature but values are discarded
+        h, w = motion_latents.shape[3], motion_latents.shape[4]
+        dummy_block = torch.zeros(16, nfpb, h, w,
+                                  dtype=self.param_dtype, device=self.device)
+        dummy_cond = torch.zeros(1, 16, nfpb, h, w,
+                                 dtype=self.param_dtype, device=self.device)
+        dummy_audio = torch.zeros(1, 25, 1024, nfpb * 4,
+                                  dtype=self.param_dtype, device=self.device)
 
-        # Broadcast to all batch slots
+        self.noise_model(
+            [dummy_block],
+            t=torch.zeros([1, nfpb], device=self.device, dtype=self.param_dtype),
+            context=context[0:1], seq_len=None,
+            cond_states=dummy_cond,
+            motion_latents=motion_latents, ref_latents=ref_latents,
+            audio_input=dummy_audio,
+            motion_frames=[self.motion_frames, lat_motion_frames],
+            drop_motion_frames=False,
+            sink_flag=True,
+            kv_cache=prefill_kv, crossattn_cache=prefill_crossattn,
+            current_start=0, current_end=nfpb * frame_seq_length)
+
+        # Broadcast cond cache from slot 0 to all slots
+        # (k, v are untouched by prefill — still zeros; crossattn_cache likewise)
         for li in range(len(self.kv_cache)):
-            for key in ["k", "v", "cond_k", "cond_v"]:
+            for key in ["cond_k", "cond_v"]:
                 self.kv_cache[li][key][:] = prefill_kv[li][key]
             self.kv_cache[li]["cond_end"] = prefill_kv[li]["cond_end"]
-        for li in range(len(self.crossattn_cache)):
-            self.crossattn_cache[li]["k"] = prefill_crossattn[li]["k"].expand(num_steps, -1, -1, -1).contiguous()
-            self.crossattn_cache[li]["v"] = prefill_crossattn[li]["v"].expand(num_steps, -1, -1, -1).contiguous()
-            self.crossattn_cache[li]["is_init"] = prefill_crossattn[li]["is_init"]
 
         if self.offload_kv_cache:
             self._move_kv_cache_to_device("cpu")
@@ -249,8 +247,6 @@ class WanS2V:
         seed=-1,
         offload_model=True,
         max_repeat=1000000,
-        enable_online_decode=False,
-        profiler=None,
         torch_trace=False,
         profile_output_dir=None,
     ):
@@ -300,103 +296,73 @@ class WanS2V:
             num_train_timesteps=self.num_train_timesteps, shift=3)
 
         # ---- 2. Generate clips ----
+        lat_target_frames = (infer_frames + 3 + self.motion_frames) // 4 - lat_motion_frames
+        target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
+        frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
+        nfpb = self.num_frames_per_block
+        num_blocks = target_shape[0] // nfpb
+        bsl = nfpb * frame_seq_length  # tokens per block in KV cache
+        max_seq_len = np.prod(target_shape) // 4
+
         with torch.amp.autocast('cuda', dtype=self.param_dtype), torch.no_grad():
             out = []
             clip_outputs = []
-            self.kv_cache = None
             active_nr = min(max_repeat, num_repeat)
 
+            if offload_model:
+                self.noise_model.to(self.device)
+                self.vae.model.cpu()
+                self.text_encoder.model.cpu()
+                self.audio_encoder.model.cpu()
+                torch.cuda.empty_cache()
+
+            self._initialize_kv_cache(num_steps, self.param_dtype, self.device, max_seq_len)
+            self._initialize_crossattn_cache(num_steps, self.param_dtype, self.device)
+
+            # ---- Prefill cond cache ----
+            dummy_cond = torch.zeros(
+                1, 16, nfpb, HEIGHT // 8, WIDTH // 8,
+                dtype=self.param_dtype, device=self.device)
+            self._prefill_cond_cache(
+                context=context,
+                motion_latents=motion_latents,
+                ref_latents=ref_latents,
+                lat_motion_frames=lat_motion_frames,
+                nfpb=nfpb,
+                frame_seq_length=frame_seq_length,
+                num_steps=num_steps)
+
+            # ---- Setup scheduler ----
+            sample_scheduler.set_timesteps(sampling_steps, device=self.device)
+            self._sampler_timesteps = sample_scheduler.timesteps
+            self._sampler_sigmas = sample_scheduler.sigmas
+            timesteps = self._sampler_timesteps
+
             for r in range(active_nr):
-                # ---- 2.1 clip-level setup ----
+                # ---- Clip-level setup ----
                 seed_g = torch.Generator(device=self.device)
                 seed_g.manual_seed(seed + r)
-
-                lat_target_frames = (infer_frames + 3 + self.motion_frames) // 4 - lat_motion_frames
-                target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
-                frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
-                nfpb = self.num_frames_per_block
-                num_blocks = target_shape[0] // nfpb
-                bsl = nfpb * frame_seq_length  # tokens per block in KV cache
-                max_seq_len = np.prod(target_shape) // 4
-
                 clip_noise = torch.randn(
                     16, target_shape[0], target_shape[1], target_shape[2],
                     dtype=self.param_dtype, device=self.device, generator=seed_g)
-                clip_output = torch.zeros_like(clip_noise)
-
-                if self.kv_cache is None:
-                    if offload_model:
-                        self.noise_model.to(self.device)
-                        self.vae.model.cpu()
-                        self.text_encoder.model.cpu()
-                        self.audio_encoder.model.cpu()
-                        torch.cuda.empty_cache()
-
-                    self._initialize_kv_cache(num_steps, self.param_dtype, self.device, max_seq_len)
-                    self._initialize_crossattn_cache(num_steps, self.param_dtype, self.device)
-
-                # ---- 2.2 clip-level cond ----
-                left_idx = r * infer_frames
-                right_idx = r * infer_frames + infer_frames
-                cond_latents = torch.zeros(
-                    1, 16, target_shape[0], target_shape[1], target_shape[2],
-                    dtype=self.param_dtype, device=self.device)
-                audio_input = audio_emb[..., left_idx:right_idx]
+                audio_input = audio_emb[..., r * infer_frames:(r + 1) * infer_frames]
                 input_motion_latents = motion_latents.clone()
+                clip_output = torch.zeros_like(clip_noise)
 
                 if offload_model:
                     self.noise_model.to(self.device)
                     self.vae.model.cpu()
                     torch.cuda.empty_cache()
 
-                # ---- 2.3 prefill cond cache ----
-                if r == 0 or (r == 1 and enable_online_decode):
-                    self._prefill_batch1(
-                        block_latents=clip_noise[:, :nfpb],
-                        cond=cond_latents[:, :, :nfpb],
-                        audio=audio_input[..., :nfpb * 4],
-                        context=context,
-                        motion_latents=input_motion_latents,
-                        ref_latents=ref_latents,
-                        motion_frames=self.motion_frames,
-                        lat_motion_frames=lat_motion_frames,
-                        drop_motion=self.drop_first_motion and r == 0,
-                        nfpb=nfpb,
-                        frame_seq_length=frame_seq_length,
-                        num_steps=num_steps)
-
-                # ---- 2.4 setup scheduler ----
-                if getattr(self, '_sampler_timesteps', None) is None:
-                    sample_scheduler.set_timesteps(sampling_steps, device=self.device)
-                    self._sampler_timesteps = sample_scheduler.timesteps
-                    self._sampler_sigmas = sample_scheduler.sigmas
-
-                timesteps = self._sampler_timesteps
-
-                # ---- 2.5 precompute per-iteration constants ----
-                # Timestep tensor: each row is one pipeline stage's timestep repeated nfpb times
-                batch_t = torch.stack([
-                    timesteps[i].expand(nfpb) for i in range(num_steps)
-                ])  # [num_steps, nfpb]
-
-                batch_context = context[0:1] * num_steps
-                batch_ref = ref_latents.expand(num_steps, -1, -1, -1, -1)
-                batch_motion = input_motion_latents.expand(num_steps, -1, -1, -1, -1)
-
-                dummy_noise = torch.zeros(
-                    16, nfpb, target_shape[1], target_shape[2],
-                    dtype=self.param_dtype, device=self.device)
-
-                # ---- 2.6 denoising ----
+                # ---- Denoising ----
                 clip_base = r * num_blocks * bsl
-                current_start_base = clip_base
 
                 for block_index in tqdm(range(num_blocks), desc=f"clip {r}"):
                     block_latents = clip_noise[:, block_index * nfpb:(block_index + 1) * nfpb]
                     la = block_index * (nfpb * 4)
                     ra = (block_index + 1) * (nfpb * 4)
                     cs = block_index * bsl + clip_base
-                    ce = (block_index + 1) * bsl + clip_base
+                    ce = cs + bsl
 
                     sample_scheduler.timesteps = self._sampler_timesteps
                     sample_scheduler.sigmas = self._sampler_sigmas
@@ -407,7 +373,6 @@ class WanS2V:
                         if self.offload_kv_cache:
                             self._move_kv_cache_to_device(self.device)
 
-                        # Use the step_i-th batch slot's KV cache
                         step_kv = [{
                             "k": layer["k"][step_i:step_i+1],
                             "v": layer["v"][step_i:step_i+1],
@@ -424,64 +389,32 @@ class WanS2V:
                         noise_pred = self.noise_model(
                             [block_latents],
                             t=t.unsqueeze(0).expand(1, nfpb),
-                            context=context[0:1],
-                            seq_len=None,
-                            cond_states=cond_latents[:, :, block_index * nfpb:(block_index + 1) * nfpb],
+                            context=context[0:1], seq_len=None,
+                            cond_states=dummy_cond,
                             motion_latents=input_motion_latents,
                             ref_latents=ref_latents,
                             audio_input=audio_input[..., la:ra],
                             motion_frames=[self.motion_frames, lat_motion_frames],
-                            drop_motion_frames=(self.drop_first_motion and r == 0),
-                            kv_cache=step_kv,
-                            crossattn_cache=step_crossattn,
-                            current_start=cs,
-                            current_end=ce)
+                            drop_motion_frames=False,
+                            kv_cache=step_kv, crossattn_cache=step_crossattn,
+                            current_start=cs, current_end=ce)
 
                         if self.offload_kv_cache:
                             self._move_kv_cache_to_device("cpu")
 
                         block_latents = sample_scheduler.step(
-                            noise_pred[0].unsqueeze(0),
-                            t,
+                            noise_pred[0].unsqueeze(0), t,
                             block_latents.unsqueeze(0),
-                            return_dict=False,
-                            generator=seed_g
+                            return_dict=False, generator=seed_g
                         )[0].squeeze(0)
 
                     clip_output[:, block_index * nfpb:(block_index + 1) * nfpb] = block_latents
 
-                # ---- 2.7 clip postprocess ----
-                if r == 0 and enable_online_decode:
-                    if offload_model:
-                        self.noise_model.cpu()
-                        self.vae.model.to(self.device)
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                    ref_latents = clip_output.unsqueeze(0)[:, :, 0:1]
-                    decode_latents = torch.cat(
-                        [motion_latents, clip_output.unsqueeze(0)], dim=2)
-                    image = torch.stack(self.vae.decode(decode_latents))
-                    image = image[:, :, -(infer_frames):]
-                    image = image[:, :, 3:]
+                    # AAS: after first block, replace sink with generated latent
+                    if r == 0 and block_index == 0:
+                        ref_latents = block_latents.unsqueeze(0)[:, :, 0:1]
 
-                    overlap_frames_num = min(self.motion_frames, image.shape[2])
-                    videos_last_frames = torch.cat([
-                        videos_last_frames[:, :, overlap_frames_num:],
-                        image[:, :, -overlap_frames_num:],
-                    ], dim=2)
-                    videos_last_frames = videos_last_frames.to(
-                        dtype=motion_latents.dtype, device=motion_latents.device)
-                    motion_latents = torch.stack(
-                        self.vae.encode(videos_last_frames)
-                    ).type_as(clip_noise)
-                    out.append(image.cpu())
-                    if offload_model:
-                        self.vae.model.cpu()
-                        self.noise_model.to(self.device)
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                else:
-                    clip_outputs.append(clip_output.detach().cpu())
+                clip_outputs.append(clip_output.detach().cpu())
 
         # ---- 3. Deferred VAE decode ----
         print(f"complete full-sequence generation")
@@ -501,7 +434,7 @@ class WanS2V:
                     [motion_latents_pp, clip_output.unsqueeze(0)], dim=2)
                 image = torch.stack(self.vae.decode(decode_latents))
                 image = image[:, :, -(infer_frames):]
-                if not enable_online_decode and clip_idx == 0:
+                if clip_idx == 0:
                     image = image[:, :, 3:]
 
                 overlap_frames_num = min(self.motion_frames, image.shape[2])
