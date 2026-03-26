@@ -1,0 +1,47 @@
+# Wan S2V 14B — standalone config (no Python imports)
+
+# T5 text encoder
+t5_model: umt5_xxl
+t5_dtype: bfloat16
+text_len: 512
+t5_checkpoint: models_t5_umt5-xxl-enc-bf16.pth
+t5_tokenizer: google/umt5-xxl
+
+# VAE
+vae_checkpoint: Wan2.1_VAE.pth
+vae_stride: [4, 8, 8]
+
+# Wav2Vec
+wav2vec: wav2vec2-large-xlsr-53-english
+
+# Transformer (DiT)
+param_dtype: bfloat16
+num_train_timesteps: 1000
+sample_fps: 25
+num_frames_per_block: 3
+
+transformer:
+  patch_size: [1, 2, 2]
+  dim: 5120
+  ffn_dim: 13824
+  freq_dim: 256
+  num_heads: 40
+  num_layers: 40
+  window_size: [-1, -1]
+  qk_norm: true
+  cross_attn_norm: true
+  eps: 1.0e-6
+  enable_adain: true
+  adain_mode: attn_norm
+  audio_inject_layers: [0, 4, 8, 12, 16, 20, 24, 27, 30, 33, 36, 39]
+  zero_init: true
+  zero_timestep: true
+  enable_motioner: false
+  add_last_motion: true
+  trainable_token: false
+  enable_tsm: false
+  enable_framepack: true
+  framepack_drop_mode: padd
+  audio_dim: 1024
+  motion_frames: 73
+  cond_dim: 16

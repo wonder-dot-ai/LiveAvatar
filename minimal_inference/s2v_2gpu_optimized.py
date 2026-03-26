@@ -33,6 +33,9 @@ def parse_args():
                     help="Offload models to CPU between stages")
     p.add_argument("--offload_kv_cache", action="store_true",
                     help="Offload KV cache to CPU between forward passes")
+    # Saving
+    p.add_argument("--save_merged", default=None,
+                    help="Save merged DiT (base+LoRA) to this dir for fast reload")
     # Output
     p.add_argument("--output", default="output/result_optimized.mp4", help="Output video path")
     p.add_argument("--fps", type=int, default=25, help="Output video FPS")
@@ -40,13 +43,21 @@ def parse_args():
 
 
 def main():
+    import time
     args = parse_args()
 
-    # Load config
-    from liveavatar.models.wan.wan_2_2.configs.wan_s2v_14B_modified import s2v_14B as cfg
+    t0 = time.perf_counter()
+    print(f"[TIMING] start")
 
-    # Create pipeline
+    from configs.load_config import load_config
+    cfg = load_config("configs/s2v_14B.yaml")
+    t1 = time.perf_counter()
+    print(f"[TIMING] Load config: {t1 - t0:.2f}s")
+
     from liveavatar.models.wan.causal_s2v_pipeline_2gpu_optimized import WanS2V
+    t2 = time.perf_counter()
+    print(f"[TIMING] Import pipeline module: {t2 - t1:.2f}s")
+
     print(f"Creating optimized pipeline (offload_model={args.offload_model}, "
           f"offload_kv_cache={args.offload_kv_cache}, fp8={args.fp8})")
     pipeline = WanS2V(
@@ -56,18 +67,22 @@ def main():
         offload_kv_cache=args.offload_kv_cache,
     )
 
-    # Load LoRA if specified
+    # Load LoRA if specified (skip if using pre-merged checkpoint)
     if args.load_lora:
         with open(args.config) as f:
             lora_cfg = yaml.safe_load(f)
         print(f"Loading LoRA from {args.load_lora} (rank={lora_cfg['lora_rank']})")
-        pipeline.noise_model = pipeline.add_lora_to_model(
-            pipeline.noise_model,
+        pipeline.load_lora(
+            lora_path=args.load_lora,
             lora_rank=lora_cfg['lora_rank'],
             lora_alpha=lora_cfg['lora_alpha'],
             lora_target_modules=lora_cfg['lora_target_modules'],
-            init_lora_weights=lora_cfg['init_lora_weights'],
-            pretrained_lora_path=args.load_lora)
+            init_lora_weights=lora_cfg['init_lora_weights'])
+
+    # Save merged model if requested
+    if args.save_merged:
+        pipeline.save_model(args.save_merged)
+        print(f"Merged model saved. Re-run with --ckpt_dir {args.save_merged} (no --load_lora) for fast startup.")
 
     # FP8 conversion
     if args.fp8:
