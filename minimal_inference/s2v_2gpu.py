@@ -27,7 +27,6 @@ def parse_args():
     p.add_argument("--max_area", type=int, default=720 * 400, help="Max pixel area")
     p.add_argument("--sample_steps", type=int, default=4, help="Diffusion sampling steps")
     p.add_argument("--seed", type=int, default=-1, help="Random seed (-1=random)")
-    p.add_argument("--n_prompt", default="", help="Negative prompt")
     # Hardware
     p.add_argument("--fp8", action="store_true", help="Enable FP8 quantization")
     p.add_argument("--offload_model", default=True, type=lambda x: x.lower() != 'false',
@@ -95,11 +94,10 @@ def main():
         ref_image_path=args.image,
         audio_path=args.audio,
         infer_frames=args.infer_frames,
-        num_repeat=args.num_clip,
+        num_clips=args.num_clip,
         max_area=args.max_area,
         sampling_steps=args.sample_steps,
         seed=args.seed,
-        n_prompt=args.n_prompt,
         offload_model=args.offload_model,
     )
 

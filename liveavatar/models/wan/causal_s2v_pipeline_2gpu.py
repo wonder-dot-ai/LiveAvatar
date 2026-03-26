@@ -23,6 +23,11 @@ from ...utils.load_weight_utils import load_state_dict
 
 class WanS2V:
 
+    # VAE encoding constants
+    REF_WARMUP_FRAMES = 5      # repeat ref image N times for stable VAE encoding
+    REF_SKIP_LATENT_FRAMES = 1 # drop first N latent frames (VAE cold start)
+    DECODE_SKIP_PIXEL_FRAMES = 3  # drop first N decoded frames (ref padding artifact)
+
     def __init__(
         self,
         config,
@@ -32,8 +37,7 @@ class WanS2V:
     ):
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
-        self.num_train_timesteps = config.num_train_timesteps  # 1000
-        self.num_frames_per_block = config.num_frames_per_block
+        self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
         self.checkpoint_dir = checkpoint_dir
         self.offload_kv_cache = offload_kv_cache
@@ -58,18 +62,35 @@ class WanS2V:
 
         self.noise_model.freqs.to(device=self.device)
         self.noise_model.eval().requires_grad_(False)
-        self.noise_model.num_frame_per_block = self.num_frames_per_block
+        self.noise_model.num_frame_per_block = config.num_frames_per_block
 
         self.audio_encoder = AudioEncoder(
             model_id=os.path.join(checkpoint_dir, "wav2vec2-large-xlsr-53-english"))
 
-        self.sample_neg_prompt = config.sample_neg_prompt
-        self.motion_frames = config.transformer.motion_frames
-        # config.drop_first_motion is True (training augmentation), but at inference
-        # we keep motion frames so the first clip stays faithful to the reference image
-        self.drop_first_motion = False
         self.fps = config.sample_fps
         self.audio_sample_m = 0
+
+        # Dimensions from config
+        self.latent_channels = config.transformer.cond_dim           # 16 (= VAE z_dim)
+        self.motion_frames = config.transformer.motion_frames        # 73 pixel frames
+        self.latent_frames_per_block = config.num_frames_per_block   # 3
+
+        # Strides
+        vae_t, vae_s, _ = config.vae_stride                         # (4, 8, 8)
+        _, patch_h, patch_w = config.transformer.patch_size          # (1, 2, 2)
+        self.vae_temporal_stride = vae_t       # pixel frames per latent frame
+        self.vae_spatial_stride = vae_s        # pixel pixels per latent pixel
+        self.patch_spatial_stride = patch_h * patch_w  # latent pixels per DiT token
+
+        # DiT dimensions (from loaded model)
+        self.dit_num_heads = config.transformer.num_heads                        # 40
+        self.dit_head_dim = config.transformer.dim // self.dit_num_heads             # 128
+        self.dit_num_layers = config.transformer.num_layers          # 40
+        self.dit_max_cond_cache_tokens = 2800  # hardcoded max cond sequence length
+
+        # Audio encoder dimensions (wav2vec2-large-xlsr-53)
+        self.audio_feature_dim = config.transformer.audio_dim        # 1024
+        self.audio_num_layers = 25  # wav2vec2-large: 24 transformer + 1 feature extraction
 
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4,
                           lora_target_modules="q,k,v,o,ffn.0,ffn.2",
@@ -138,7 +159,7 @@ class WanS2V:
 
     def encode_audio(self, audio_path, infer_frames):
         z = self.audio_encoder.extract_audio_feat(audio_path, return_all_layers=True)
-        audio_embed_bucket, num_repeat = self.audio_encoder.get_audio_embed_bucket_fps(
+        audio_embed_bucket, num_clips = self.audio_encoder.get_audio_embed_bucket_fps(
             z, fps=self.fps, batch_frames=infer_frames, m=self.audio_sample_m)
         audio_embed_bucket = audio_embed_bucket.to(self.device, self.param_dtype)
         audio_embed_bucket = audio_embed_bucket.unsqueeze(0)
@@ -146,29 +167,25 @@ class WanS2V:
             audio_embed_bucket = audio_embed_bucket.permute(0, 2, 1)
         elif len(audio_embed_bucket.shape) == 4:
             audio_embed_bucket = audio_embed_bucket.permute(0, 2, 3, 1)
-        return audio_embed_bucket, num_repeat
+        return audio_embed_bucket, num_clips
 
-    def encode_prompt(self, input_prompt, n_prompt=None, offload_model=True):
-        context_null = None
-        if n_prompt == "":
-            n_prompt = self.sample_neg_prompt
+    def encode_prompt(self, input_prompt, offload_model=True):
         self.text_encoder.model.to(self.device)
-        context = self.text_encoder([input_prompt], self.device)
-        if n_prompt is not None:
-            context_null = self.text_encoder([n_prompt], self.device)
+        text_prompt_embeddings = self.text_encoder([input_prompt], self.device)
         if offload_model:
             self.text_encoder.model.cpu()
-        return context, context_null
+        return text_prompt_embeddings
 
     def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size=13500):
         cache_device = "cpu" if self.offload_kv_cache else device
+        nh, hd = self.dit_num_heads, self.dit_head_dim
         self.kv_cache = [{
-            "k": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=cache_device),
-            "v": torch.zeros([batch_size, kv_cache_size, 40, 128], dtype=dtype, device=cache_device),
-            "cond_k": torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=cache_device),
-            "cond_v": torch.zeros([batch_size, 2800, 40, 128], dtype=dtype, device=cache_device),
+            "k": torch.zeros([batch_size, kv_cache_size, nh, hd], dtype=dtype, device=cache_device),
+            "v": torch.zeros([batch_size, kv_cache_size, nh, hd], dtype=dtype, device=cache_device),
+            "cond_k": torch.zeros([batch_size, self.max_cond_cache_size, nh, hd], dtype=dtype, device=cache_device),
+            "cond_v": torch.zeros([batch_size, self.max_cond_cache_size, nh, hd], dtype=dtype, device=cache_device),
             "cond_end": torch.tensor([0], dtype=torch.long, device=cache_device),
-        } for _ in range(self.noise_model.num_layers)]
+        } for _ in range(self.dit_num_layers)]
 
     def _move_kv_cache_to_device(self, device):
         for layer in self.kv_cache:
@@ -176,14 +193,16 @@ class WanS2V:
                 layer[key] = layer[key].to(device)
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
+        nh, hd = self.dit_num_heads, self.dit_head_dim
         self.crossattn_cache = [{
-            "k": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
-            "v": torch.zeros([batch_size, 0, 40, 128], dtype=dtype, device=device),
+            "k": torch.zeros([batch_size, 0, nh, hd], dtype=dtype, device=device),
+            "v": torch.zeros([batch_size, 0, nh, hd], dtype=dtype, device=device),
             "is_init": False,
-        } for _ in range(self.noise_model.num_layers)]
+        } for _ in range(self.dit_num_layers)]
 
-    def _prefill_cond_cache(self, context, motion_latents, ref_latents,
-                           lat_motion_frames, nfpb, frame_seq_length, num_steps):
+    def _prefill_cond_cache(self, text_prompt_embeddings, motion_latents, ref_image_latents,
+                           latent_motion_frames, latent_frames_per_block,
+                           tokens_per_latent_frame, num_denoising_steps):
         """Cache conditioning (ref, motion, text) into KV cache, broadcast to all slots.
 
         The model's _forward_sink requires block_latents, cond, and audio in its
@@ -203,29 +222,32 @@ class WanS2V:
             self._move_kv_cache_to_device(self.device)
 
         # Dummies — required by model signature but values are discarded
-        h, w = motion_latents.shape[3], motion_latents.shape[4]
-        dummy_block = torch.zeros(16, nfpb, h, w,
+        latent_h, latent_w = motion_latents.shape[3], motion_latents.shape[4]
+        fpb = latent_frames_per_block
+        dummy_block = torch.zeros(self.latent_channels, fpb, latent_h, latent_w,
                                   dtype=self.param_dtype, device=self.device)
-        dummy_cond = torch.zeros(1, 16, nfpb, h, w,
+        dummy_cond = torch.zeros(1, self.latent_channels, fpb, latent_h, latent_w,
                                  dtype=self.param_dtype, device=self.device)
-        dummy_audio = torch.zeros(1, 25, 1024, nfpb * 4,
+        dummy_audio = torch.zeros(1, self.audio_num_layers, self.audio_feature_dim,
+                                  fpb * self.vae_temporal_stride,
                                   dtype=self.param_dtype, device=self.device)
 
         self.noise_model(
             [dummy_block],
-            t=torch.zeros([1, nfpb], device=self.device, dtype=self.param_dtype),
-            context=context[0:1], seq_len=None,
+            t=torch.zeros([1, fpb], device=self.device, dtype=self.param_dtype),
+            context=text_prompt_embeddings[0:1], seq_len=None,
+            ref_latents=ref_image_latents,
+            motion_latents=motion_latents,
             cond_states=dummy_cond,
-            motion_latents=motion_latents, ref_latents=ref_latents,
             audio_input=dummy_audio,
-            motion_frames=[self.motion_frames, lat_motion_frames],
+            motion_frames=[self.motion_frames, latent_motion_frames],
             drop_motion_frames=False,
             sink_flag=True,
             kv_cache=prefill_kv, crossattn_cache=prefill_crossattn,
-            current_start=0, current_end=nfpb * frame_seq_length)
+            current_start=0,
+            current_end=fpb * tokens_per_latent_frame)
 
         # Broadcast cond cache from slot 0 to all slots
-        # (k, v are untouched by prefill — still zeros; crossattn_cache likewise)
         for li in range(len(self.kv_cache)):
             for key in ["cond_k", "cond_v"]:
                 self.kv_cache[li][key][:] = prefill_kv[li][key]
@@ -234,80 +256,101 @@ class WanS2V:
         if self.offload_kv_cache:
             self._move_kv_cache_to_device("cpu")
 
+    def _prepare_image(self, ref_image_path, max_area):
+        """Encode reference image → ref_image_latents + motion_latents."""
+        ref_image = np.array(Image.open(ref_image_path).convert('RGB'))
+        HEIGHT, WIDTH = self.get_size_less_than_area(
+            ref_image.shape[0], ref_image.shape[1], target_area=max_area)
+
+        resize_op = transforms.Resize(min(HEIGHT, WIDTH))
+        crop_op = transforms.CenterCrop((HEIGHT, WIDTH))
+
+        self.vae.model.to(self.device)
+
+        # Preprocess reference image → pixel tensor [-1, 1]
+        ref_pixel = transforms.ToTensor()(crop_op(resize_op(Image.fromarray(ref_image))))
+        ref_pixel = ref_pixel.unsqueeze(1).unsqueeze(0) * 2 - 1.0
+        ref_pixel = ref_pixel.to(dtype=self.vae.dtype, device=self.vae.device)
+
+        # VAE encode: ref image repeated as motion context (5 * 73 = 365 pixel frames)
+        # First REF_WARMUP_FRAMES copies warm up the VAE's causal convolutions.
+        # ref_image_latents is one stable latent frame sliced from the result.
+        motion_pixel_frames = ref_pixel.repeat(1, 1, self.REF_WARMUP_FRAMES * self.motion_frames, 1, 1)
+        motion_latents = torch.stack(self.vae.encode(motion_pixel_frames))
+        ref_image_latents = motion_latents[:, :, self.REF_SKIP_LATENT_FRAMES:self.REF_SKIP_LATENT_FRAMES + 1]
+
+        return ref_image_latents, motion_latents, motion_pixel_frames.detach(), HEIGHT, WIDTH
+
+    def _prepare_text(self, input_prompt, offload_model):
+        """Encode text prompt → T5 embeddings."""
+        return self.encode_prompt(input_prompt, offload_model)
+
+    def _prepare_audio(self, audio_path, infer_frames, num_clips):
+        """Encode full audio file and determine clip count."""
+        self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
+        self.audio_encoder.model.requires_grad_(False)
+        self.audio_encoder.model.eval()
+
+        audio_embeddings, max_clips = self.encode_audio(audio_path, infer_frames=infer_frames)
+        self.audio_encoder.model.to("cpu")
+
+        if num_clips is None or num_clips > max_clips:
+            num_clips = max_clips
+
+        return audio_embeddings, num_clips
+
     def generate(
         self,
         input_prompt=None,
         ref_image_path=None,
         audio_path=None,
-        num_repeat=1,
+        num_clips=1,
         max_area=720 * 1280,
         infer_frames=80,
         sampling_steps=4,
-        n_prompt="",
         seed=-1,
         offload_model=True,
-        max_repeat=1000000,
-        torch_trace=False,
-        profile_output_dir=None,
+        max_clips=1000000,
     ):
-        num_steps = sampling_steps  # pipeline depth = number of denoising steps
-
-        # ---- 1. Prepare conditional inputs ----
-        ref_image = np.array(Image.open(ref_image_path).convert('RGB'))
-        HEIGHT, WIDTH = self.get_size_less_than_area(
-            ref_image.shape[0], ref_image.shape[1], target_area=max_area)
-        size = (HEIGHT, WIDTH)
-
-        resize_op = transforms.Resize(min(HEIGHT, WIDTH))
-        crop_op = transforms.CenterCrop((HEIGHT, WIDTH))
-        tensor_trans = transforms.ToTensor()
-
-        self.audio_encoder.model.to(device=self.device, dtype=self.param_dtype)
-        self.audio_encoder.model.requires_grad_(False)
-        self.audio_encoder.model.eval()
-        self.vae.model.to(self.device)
-
-        audio_emb, nr = self.encode_audio(audio_path, infer_frames=infer_frames)
-        self.audio_encoder.model.to("cpu")
-        if num_repeat is None or num_repeat > nr:
-            num_repeat = nr
-
-        lat_motion_frames = (self.motion_frames + 3) // 4
-        model_pic = crop_op(resize_op(Image.fromarray(ref_image)))
-
-        ref_pixel_values = tensor_trans(model_pic)
-        ref_pixel_values = ref_pixel_values.unsqueeze(1).unsqueeze(0) * 2 - 1.0
-        ref_pixel_values = ref_pixel_values.to(dtype=self.vae.dtype, device=self.vae.device)
-        ref_pixel_values = ref_pixel_values.repeat(1, 1, 5, 1, 1)
-        ref_latents = torch.stack(self.vae.encode(ref_pixel_values))[:, :, 1:]
-
-        motion_latents = ref_pixel_values.repeat(1, 1, self.motion_frames, 1, 1)
-        videos_last_frames = motion_latents.detach()
-        motion_latents = torch.stack(self.vae.encode(motion_latents))
-
+        num_denoising_steps = sampling_steps
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
 
-        if n_prompt == "":
-            n_prompt = self.sample_neg_prompt
-        context, context_null = self.encode_prompt(input_prompt, n_prompt, offload_model)
+        # ---- 1. Prepare conditional inputs ----
+        ref_image_latents, motion_latents, motion_pixel_frames, HEIGHT, WIDTH = \
+            self._prepare_image(ref_image_path, max_area)
+        text_prompt_embeddings = self._prepare_text(input_prompt, offload_model)
+        audio_embeddings, num_clips = self._prepare_audio(
+            audio_path, infer_frames, num_clips)
 
-        print("complete prepare conditional inputs")
+        # Latent space dimensions
+        latent_motion_frames = math.ceil(self.motion_frames / self.vae_temporal_stride)
+        latent_h = HEIGHT // self.vae_spatial_stride
+        latent_w = WIDTH // self.vae_spatial_stride
+        latent_target_frames = (
+            math.ceil((infer_frames + self.motion_frames) / self.vae_temporal_stride)
+            - latent_motion_frames)
+        latent_shape = [latent_target_frames, latent_h, latent_w]
+
+        # Block/token dimensions
+        latent_frames_per_block = self.latent_frames_per_block
+        num_blocks = latent_target_frames // latent_frames_per_block
+        tokens_per_latent_frame = latent_h * latent_w // self.patch_spatial_stride
+        tokens_per_block = latent_frames_per_block * tokens_per_latent_frame
+        max_tokens = np.prod(latent_shape) // self.patch_spatial_stride
+        audio_frames_per_block = latent_frames_per_block * self.vae_temporal_stride
+
         sample_scheduler = FlowMatchEulerDiscreteScheduler(
             num_train_timesteps=self.num_train_timesteps, shift=3)
 
         # ---- 2. Generate clips ----
-        lat_target_frames = (infer_frames + 3 + self.motion_frames) // 4 - lat_motion_frames
-        target_shape = [lat_target_frames, HEIGHT // 8, WIDTH // 8]
-        frame_seq_length = HEIGHT // 8 * WIDTH // 8 // 2 // 2
-        nfpb = self.num_frames_per_block
-        num_blocks = target_shape[0] // nfpb
-        bsl = nfpb * frame_seq_length  # tokens per block in KV cache
-        max_seq_len = np.prod(target_shape) // 4
-
         with torch.amp.autocast('cuda', dtype=self.param_dtype), torch.no_grad():
-            out = []
-            clip_outputs = []
-            active_nr = min(max_repeat, num_repeat)
+            decoded_clips = []
+            clip_latent_outputs = []
+            total_clips = min(max_clips, num_clips)
+
+            dummy_cond = torch.zeros(
+                1, self.latent_channels, latent_frames_per_block, latent_h, latent_w,
+                dtype=self.param_dtype, device=self.device)
 
             if offload_model:
                 self.noise_model.to(self.device)
@@ -316,21 +359,18 @@ class WanS2V:
                 self.audio_encoder.model.cpu()
                 torch.cuda.empty_cache()
 
-            self._initialize_kv_cache(num_steps, self.param_dtype, self.device, max_seq_len)
-            self._initialize_crossattn_cache(num_steps, self.param_dtype, self.device)
+            self._initialize_kv_cache(num_denoising_steps, self.param_dtype, self.device, max_tokens)
+            self._initialize_crossattn_cache(num_denoising_steps, self.param_dtype, self.device)
 
             # ---- Prefill cond cache ----
-            dummy_cond = torch.zeros(
-                1, 16, nfpb, HEIGHT // 8, WIDTH // 8,
-                dtype=self.param_dtype, device=self.device)
             self._prefill_cond_cache(
-                context=context,
+                text_prompt_embeddings=text_prompt_embeddings,
                 motion_latents=motion_latents,
-                ref_latents=ref_latents,
-                lat_motion_frames=lat_motion_frames,
-                nfpb=nfpb,
-                frame_seq_length=frame_seq_length,
-                num_steps=num_steps)
+                ref_image_latents=ref_image_latents,
+                latent_motion_frames=latent_motion_frames,
+                latent_frames_per_block=latent_frames_per_block,
+                tokens_per_latent_frame=tokens_per_latent_frame,
+                num_denoising_steps=num_denoising_steps)
 
             # ---- Setup scheduler ----
             sample_scheduler.set_timesteps(sampling_steps, device=self.device)
@@ -338,14 +378,14 @@ class WanS2V:
             self._sampler_sigmas = sample_scheduler.sigmas
             timesteps = self._sampler_timesteps
 
-            for r in range(active_nr):
+            for clip_index in range(total_clips):
                 # ---- Clip-level setup ----
                 seed_g = torch.Generator(device=self.device)
-                seed_g.manual_seed(seed + r)
+                seed_g.manual_seed(seed + clip_index)
                 clip_noise = torch.randn(
-                    16, target_shape[0], target_shape[1], target_shape[2],
+                    self.latent_channels, *latent_shape,
                     dtype=self.param_dtype, device=self.device, generator=seed_g)
-                audio_input = audio_emb[..., r * infer_frames:(r + 1) * infer_frames]
+                clip_audio = audio_embeddings[..., clip_index * infer_frames:(clip_index + 1) * infer_frames]
                 input_motion_latents = motion_latents.clone()
                 clip_output = torch.zeros_like(clip_noise)
 
@@ -355,49 +395,53 @@ class WanS2V:
                     torch.cuda.empty_cache()
 
                 # ---- Denoising ----
-                clip_base = r * num_blocks * bsl
+                clip_token_offset = clip_index * num_blocks * tokens_per_block
 
-                for block_index in tqdm(range(num_blocks), desc=f"clip {r}"):
-                    block_latents = clip_noise[:, block_index * nfpb:(block_index + 1) * nfpb]
-                    la = block_index * (nfpb * 4)
-                    ra = (block_index + 1) * (nfpb * 4)
-                    cs = block_index * bsl + clip_base
-                    ce = cs + bsl
+                for block_index in tqdm(range(num_blocks), desc=f"clip {clip_index}"):
+                    block_start = block_index * latent_frames_per_block
+                    block_end = block_start + latent_frames_per_block
+                    block_latents = clip_noise[:, block_start:block_end]
+
+                    audio_start = block_index * audio_frames_per_block
+                    audio_end = audio_start + audio_frames_per_block
+
+                    token_start = block_index * tokens_per_block + clip_token_offset
+                    token_end = token_start + tokens_per_block
 
                     sample_scheduler.timesteps = self._sampler_timesteps
                     sample_scheduler.sigmas = self._sampler_sigmas
                     sample_scheduler._step_index = 0
                     sample_scheduler._begin_index = 0
 
-                    for step_i, t in enumerate(timesteps):
+                    for step_index, t in enumerate(timesteps):
                         if self.offload_kv_cache:
                             self._move_kv_cache_to_device(self.device)
 
                         step_kv = [{
-                            "k": layer["k"][step_i:step_i+1],
-                            "v": layer["v"][step_i:step_i+1],
-                            "cond_k": layer["cond_k"][step_i:step_i+1],
-                            "cond_v": layer["cond_v"][step_i:step_i+1],
+                            "k": layer["k"][step_index:step_index+1],
+                            "v": layer["v"][step_index:step_index+1],
+                            "cond_k": layer["cond_k"][step_index:step_index+1],
+                            "cond_v": layer["cond_v"][step_index:step_index+1],
                             "cond_end": layer["cond_end"],
                         } for layer in self.kv_cache]
                         step_crossattn = [{
-                            "k": layer["k"][step_i:step_i+1],
-                            "v": layer["v"][step_i:step_i+1],
+                            "k": layer["k"][step_index:step_index+1],
+                            "v": layer["v"][step_index:step_index+1],
                             "is_init": layer["is_init"],
                         } for layer in self.crossattn_cache]
 
                         noise_pred = self.noise_model(
                             [block_latents],
-                            t=t.unsqueeze(0).expand(1, nfpb),
-                            context=context[0:1], seq_len=None,
+                            t=t.unsqueeze(0).expand(1, latent_frames_per_block),
+                            context=text_prompt_embeddings[0:1], seq_len=None,
                             cond_states=dummy_cond,
                             motion_latents=input_motion_latents,
-                            ref_latents=ref_latents,
-                            audio_input=audio_input[..., la:ra],
-                            motion_frames=[self.motion_frames, lat_motion_frames],
+                            ref_latents=ref_image_latents,
+                            audio_input=clip_audio[..., audio_start:audio_end],
+                            motion_frames=[self.motion_frames, latent_motion_frames],
                             drop_motion_frames=False,
                             kv_cache=step_kv, crossattn_cache=step_crossattn,
-                            current_start=cs, current_end=ce)
+                            current_start=token_start, current_end=token_end)
 
                         if self.offload_kv_cache:
                             self._move_kv_cache_to_device("cpu")
@@ -408,48 +452,48 @@ class WanS2V:
                             return_dict=False, generator=seed_g
                         )[0].squeeze(0)
 
-                    clip_output[:, block_index * nfpb:(block_index + 1) * nfpb] = block_latents
+                    clip_output[:, block_start:block_end] = block_latents
 
                     # AAS: after first block, replace sink with generated latent
-                    if r == 0 and block_index == 0:
-                        ref_latents = block_latents.unsqueeze(0)[:, :, 0:1]
+                    if clip_index == 0 and block_index == 0:
+                        ref_image_latents = block_latents.unsqueeze(0)[:, :, 0:1]
 
-                clip_outputs.append(clip_output.detach().cpu())
+                clip_latent_outputs.append(clip_output.detach().cpu())
 
         # ---- 3. Deferred VAE decode ----
-        print(f"complete full-sequence generation")
-        if clip_outputs:
+        print("complete full-sequence generation")
+        if clip_latent_outputs:
             if offload_model:
-                print(f"loading VAE for final decode")
+                print("loading VAE for final decode")
                 self.kv_cache = None
                 self.vae.model.to(self.device)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-            motion_latents_pp = motion_latents
-            for clip_idx, clip_output_cpu in enumerate(clip_outputs):
-                clip_output = clip_output_cpu.to(
+            motion_latents_decode = motion_latents
+            for clip_idx, clip_latent_cpu in enumerate(clip_latent_outputs):
+                clip_latent = clip_latent_cpu.to(
                     device=self.vae.device, dtype=self.vae.dtype)
-                decode_latents = torch.cat(
-                    [motion_latents_pp, clip_output.unsqueeze(0)], dim=2)
-                image = torch.stack(self.vae.decode(decode_latents))
+                decode_input = torch.cat(
+                    [motion_latents_decode, clip_latent.unsqueeze(0)], dim=2)
+                image = torch.stack(self.vae.decode(decode_input))
                 image = image[:, :, -(infer_frames):]
                 if clip_idx == 0:
-                    image = image[:, :, 3:]
+                    image = image[:, :, self.DECODE_SKIP_PIXEL_FRAMES:]
 
-                overlap_frames_num = min(self.motion_frames, image.shape[2])
-                videos_last_frames = torch.cat([
-                    videos_last_frames[:, :, overlap_frames_num:],
-                    image[:, :, -overlap_frames_num:],
+                overlap = min(self.motion_frames, image.shape[2])
+                motion_pixel_frames = torch.cat([
+                    motion_pixel_frames[:, :, overlap:],
+                    image[:, :, -overlap:],
                 ], dim=2)
-                videos_last_frames = videos_last_frames.to(
-                    dtype=motion_latents_pp.dtype, device=motion_latents_pp.device)
-                motion_latents_pp = torch.stack(
-                    self.vae.encode(videos_last_frames)
-                ).type_as(clip_output)
-                out.append(image.cpu())
+                motion_pixel_frames = motion_pixel_frames.to(
+                    dtype=motion_latents_decode.dtype, device=motion_latents_decode.device)
+                motion_latents_decode = torch.stack(
+                    self.vae.encode(motion_pixel_frames)
+                ).type_as(clip_latent)
+                decoded_clips.append(image.cpu())
 
-        videos = torch.cat(out, dim=2)
+        video = torch.cat(decoded_clips, dim=2)
         del clip_noise, clip_output
         self._sampler_timesteps = None
         self._sampler_sigmas = None
@@ -462,4 +506,4 @@ class WanS2V:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        return videos[0], {}
+        return video[0], {}
