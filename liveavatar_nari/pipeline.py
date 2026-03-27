@@ -38,8 +38,8 @@ class WanS2V:
         self.offload_kv_cache = offload_kv_cache
 
         # Lazy imports — deferred to avoid 30s+ module loading at import time
-        from .models.causal_model_s2v import CausalWanModel_S2V
-        from .models.causal_audio_encoder import AudioEncoder
+        from .models.causal_model_s2v_bak import CausalWanModel_S2V
+        from .modules.s2v.audio_encoder import AudioEncoder
         from .modules.t5 import T5EncoderModel
         from .modules.vae2_1 import Wan2_1_VAE
 

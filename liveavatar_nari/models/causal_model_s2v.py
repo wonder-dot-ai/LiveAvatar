@@ -47,160 +47,6 @@ from ..distributed.util import all_to_all,pad_chunk
 import torch.distributed as dist
 from ..modules.inference_utils import conditional_compile
 
-# wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
-# see https://github.com/pytorch/pytorch/issues/133254
-# change to reduce-overhead for better distributed training performance
-# flex_attention = torch.compile(
-#     flex_attention, dynamic=False, mode="max-autotune")
-
-
-def sp_attn_forward_s2v(self,
-                            x,
-                            seq_lens, #完整的而非sp的序列长度
-                            grid_sizes,
-                            freqs,
-                            block_mask=None, 
-                            kv_cache=None, 
-                            current_start=0, 
-                            current_end=0,
-                            sp_size=None,
-                            seg_idx=None
-                            ):
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        half_dtypes = (torch.float16, torch.bfloat16)
-
-        def half(x,dtype=torch.bfloat16):
-            return x if x.dtype in half_dtypes else x.to(dtype)
-
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
-        q, k, v = qkv_fn(x)
-        roped_query = rope_apply_usp(q, grid_sizes, freqs).type_as(v)
-        roped_key = rope_apply_usp(k, grid_sizes, freqs).type_as(v)
-
-        # sp compute
-        
-        roped_query = half(roped_query)
-        roped_key = half(roped_key)
-        v = half(v)
-        if not dist.is_initialized():
-            raise ValueError("distributed group should be initialized.")
-        b = q.shape[0]
-        # gather q/k/v sequence
-        sp_size = sp_size if sp_size is not None else self.sp_size
-        q = all_to_all(roped_query, scatter_dim=2, gather_dim=1, sp_size=sp_size)
-        k = all_to_all(roped_key, scatter_dim=2, gather_dim=1, sp_size=sp_size)
-        v = all_to_all(v, scatter_dim=2, gather_dim=1, sp_size=sp_size)
-
-        if kv_cache is None:
-            assert False, "not implemented for self-forcing sp"
-            # apply attention
-            padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
-            padded_roped_query = torch.cat(
-                [q,
-                    torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
-                                device=q.device, dtype=v.dtype)],
-                dim=1
-            )
-
-            padded_roped_key = torch.cat(
-                [k, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
-                                        device=k.device, dtype=v.dtype)],
-                dim=1
-            )
-
-            padded_v = torch.cat(
-                [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
-                                device=v.device, dtype=v.dtype)],
-                dim=1
-            )
-            x = flex_attention(
-                query=padded_roped_query.transpose(2, 1),
-                key=padded_roped_key.transpose(2, 1),
-                value=padded_v.transpose(2, 1),
-                block_mask=block_mask
-            )[:, :, :-padded_length].transpose(2, 1)
-        else:
-            
-            global_rank = get_rank()
-            sp_rank = global_rank % sp_size  # rank within sequence parallel group
-            # relative_start_rank = int(seq_lens // model_sp_size * sp_rank)
-            # current_start += relative_start_rank
-            current_end = current_start+k.shape[1]
-            head_start_rank = n // sp_size * sp_rank
-            head_end_rank = head_start_rank + n // sp_size
-            # 此时是完整序列和local的dim
-
-            # 使用 _GLOBAL_SEQ_LEN 获取原始序列长度（pad之前的真实长度）
-            global_length = dist_util._GLOBAL_SEQ_LEN
-            sp_full_length = k.shape[1]
-            # global_seg_idx = [seg_idx[0],seg_idx[1]*sp_size,seg_idx[2]*sp_size]
-            # global_seg_idx = seg_idx
-            # 这里序列长度为3375 （720*400），并不能被sp_size整除，因此这里推导的gloabl_length肯定会出错，暂时硬编码为3375 hard-code flag;不过实测虽然长度错了计算结果似乎没区别，但是empty_like出来的内存有不确定性。暂时这样
-            
-            if seg_idx[1]-seg_idx[0] > 0:
-                global_seg_idx = [0,global_length,global_length]
-            else:
-                global_seg_idx = [0,0,global_length]
-            
-            if global_seg_idx[1]-global_seg_idx[0] > 0: #streaming inference
-                kv_cache["k"][:, current_start:(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank] = k[:,global_seg_idx[0]:global_seg_idx[1]]
-                kv_cache["v"][:, current_start:(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank] = v[:,global_seg_idx[0]:global_seg_idx[1]]
-                x = flash_attention(
-                    q=q[:,global_seg_idx[0]:global_seg_idx[1]],
-                    k=torch.cat(
-                                [
-                                kv_cache["k"][:, :(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank],
-                                kv_cache["cond_k"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank]
-                                ],dim=1
-                                ),
-                    v=torch.cat(
-                                [
-                                kv_cache["v"][:, :(current_start+global_seg_idx[1]-global_seg_idx[0]), head_start_rank:head_end_rank],
-                                kv_cache["cond_v"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank]
-                                ],dim=1
-                                ),
-                    k_lens=torch.tensor(current_start+global_seg_idx[1]-global_seg_idx[0]+int(kv_cache["cond_end"])).repeat(b),
-                    window_size=self.window_size
-                    )
-            elif global_seg_idx[2]-global_seg_idx[1] > 0: #prefill cond caching
-                # assert False, "not implemented for prefill sp"
-                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), global_seg_idx[2]-global_seg_idx[1])
-                kv_cache["cond_k"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank] = k[:,global_seg_idx[1]:global_seg_idx[2]]
-                kv_cache["cond_v"][:, :int(kv_cache["cond_end"]), head_start_rank:head_end_rank] = v[:,global_seg_idx[1]:global_seg_idx[2]]
-
-                x = flash_attention(
-                    q=q,
-                    k=k,
-                    v=v,
-                    k_lens=torch.tensor(global_seg_idx[2]-global_seg_idx[1]).repeat(b),
-                    window_size=self.window_size)
-
-            else:
-                assert False, "segment index is invalid"
-
-        # pad x to sp_full_length
-        x = torch.cat([x, torch.zeros([b, sp_full_length-x.shape[1], x.shape[2], x.shape[3]],
-                                device=x.device, dtype=x.dtype)],
-                dim=1)
-        pad_len = sp_full_length-x.shape[1]
-        pad_shape = list(x.shape)
-        pad_shape[1] = pad_len
-        pad_x = torch.zeros(pad_shape).type_as(x)
-        x = torch.cat([x, pad_x], dim=1)
-        # scatter q/k/v sequence
-        x = all_to_all(x, scatter_dim=1, gather_dim=2, sp_size=sp_size)
-
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
-
-
 class CausalHead_S2V(Head):
 
     def forward(self, x, e):
@@ -248,137 +94,100 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
             v = self.v(x).view(b, s, n, d)
             return q, k, v
         q, k, v = qkv_fn(x)
-        
-        if kv_cache is None:
-            assert False, "not implemented for self-forcing"
-            roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
-            roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
 
-            padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
-            padded_roped_query = torch.cat(
-                [roped_query,
-                 torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
-                             device=q.device, dtype=v.dtype)],
-                dim=1
-            )
+        assert kv_cache is not None, "non-cached forward not supported"
 
-            padded_roped_key = torch.cat(
-                [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
-                                        device=k.device, dtype=v.dtype)],
-                dim=1
-            )
+        if seg_idx[1]-seg_idx[0] > 0:  # streaming inference
+            roped_query = causal_rope_apply(q, grid_sizes, freqs).type_as(v)
+            roped_key = causal_rope_apply(k, grid_sizes, freqs).type_as(v)
+            seg_len_block = seg_idx[1]-seg_idx[0]
 
-            padded_v = torch.cat(
-                [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
-                                device=v.device, dtype=v.dtype)],
-                dim=1
-            )
-            x = flex_attention(
-                query=padded_roped_query.transpose(2, 1),
-                key=padded_roped_key.transpose(2, 1),
-                value=padded_v.transpose(2, 1),
-                block_mask=block_mask
-            )[:, :, :-padded_length].transpose(2, 1)
-        else:
-            if seg_idx[1]-seg_idx[0] > 0: #streaming inference
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
-                roped_key = causal_rope_apply(
-                    k, grid_sizes, freqs).type_as(v)
-                seg_len_block = seg_idx[1]-seg_idx[0]
+            if isinstance(current_start, torch.Tensor):
+                # Per-batch path (batched pipeline)
+                active_cond_cache_size = int(kv_cache["cond_end"])
+                kv_max = kv_cache['k'].shape[1]
 
-                if isinstance(current_start, torch.Tensor):
-                    # --- Per-batch path (batched pipeline) ---
-                    active_cond_cache_size = int(kv_cache["cond_end"])
-                    kv_max = kv_cache['k'].shape[1]
+                active_sizes = []
+                for bi in range(b):
+                    cs = int(current_start[bi].item())
+                    if cs >= kv_max:
+                        cs = cs % kv_max
+                    kv_cache["k"][bi, cs:(cs+seg_len_block)] = roped_key[bi, seg_idx[0]:seg_idx[1]]
+                    kv_cache["v"][bi, cs:(cs+seg_len_block)] = v[bi, seg_idx[0]:seg_idx[1]]
+                    active_sizes.append(min(cs + seg_len_block, kv_max))
 
-                    active_sizes = []
-                    for bi in range(b):
-                        cs = int(current_start[bi].item())
-                        if cs >= kv_max:
-                            cs = cs % kv_max
-                        kv_cache["k"][bi, cs:(cs+seg_len_block)] = roped_key[bi, seg_idx[0]:seg_idx[1]]
-                        kv_cache["v"][bi, cs:(cs+seg_len_block)] = v[bi, seg_idx[0]:seg_idx[1]]
-                        active_sizes.append(min(cs + seg_len_block, kv_max))
+                max_active_size = max(active_sizes)
 
-                    max_active_size = max(active_sizes)
+                cond_k_roped = causal_rope_apply_cond(
+                    kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
+                ).type_as(v)
 
-                    cond_k_roped = causal_rope_apply_cond(
-                        kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
-                    ).type_as(v)
+                k_cat = torch.cat([
+                    kv_cache["k"][:, :max_active_size],
+                    cond_k_roped
+                ], dim=1)
+                v_cat = torch.cat([
+                    kv_cache["v"][:, :max_active_size],
+                    kv_cache["cond_v"][:, :active_cond_cache_size]
+                ], dim=1)
 
-                    k_cat = torch.cat([
-                        kv_cache["k"][:, :max_active_size],
-                        cond_k_roped
-                    ], dim=1)
-                    v_cat = torch.cat([
-                        kv_cache["v"][:, :max_active_size],
-                        kv_cache["cond_v"][:, :active_cond_cache_size]
-                    ], dim=1)
+                k_lens = torch.tensor([
+                    active_sizes[bi] + active_cond_cache_size
+                    for bi in range(b)
+                ], dtype=torch.int32, device=x.device)
 
-                    k_lens = torch.tensor([
-                        active_sizes[bi] + active_cond_cache_size
-                        for bi in range(b)
-                    ], dtype=torch.int32, device=x.device)
-
-                    x = flash_attention(
-                        q=roped_query[:, seg_idx[0]:seg_idx[1]],
-                        k=k_cat, v=v_cat,
-                        k_lens=k_lens,
-                        window_size=self.window_size)
-                else:
-                    # --- Scalar path (original code, backward compatible) ---
-                    active_kv_cache_start = 0
-                    if current_start >= kv_cache['k'].shape[1]:# for case current_start > kv_cache size, kv_rolling
-                        assert self.local_attn_size == -1, "local_attn_size should be -1 for streaming inference"
-                        current_start = current_start % kv_cache['k'].shape[1]
-                        active_kv_cache_size = kv_cache['k'].shape[1]
-                        active_cond_cache_size = int(kv_cache["cond_end"])
-                    else:
-                        active_kv_cache_size = current_start+seg_len_block
-                        if self.local_attn_size != -1:
-                            # hard-code for case num_frames_per_block=3
-                            active_kv_cache_start = max(0,active_kv_cache_size - self.local_attn_size * seg_len_block // 3)
-                        active_cond_cache_size = int(kv_cache["cond_end"])
-
-                    kv_cache["k"][:, current_start:(current_start+seg_len_block)] = roped_key[:,seg_idx[0]:seg_idx[1]]
-                    kv_cache["v"][:, current_start:(current_start+seg_len_block)] = v[:,seg_idx[0]:seg_idx[1]]
-                    x = attention(
-                        q=roped_query[:,seg_idx[0]:seg_idx[1]],
-                        k=torch.cat(
-                                    [
-                                    kv_cache["k"][:, active_kv_cache_start:active_kv_cache_size],
-                                    causal_rope_apply_cond(
-                                        kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
-                                        ).type_as(v)
-                                    ],dim=1
-                                    ),
-                        v=torch.cat(
-                                    [
-                                    kv_cache["v"][:, active_kv_cache_start:active_kv_cache_size],
-                                    kv_cache["cond_v"][:, :active_cond_cache_size]
-                                    ],dim=1
-                                    ),
-                        k_lens=torch.tensor(active_kv_cache_size - active_kv_cache_start + active_cond_cache_size).repeat(b),
-                        window_size=self.window_size
-                        )
-            elif seg_idx[2]-seg_idx[1] > 0: #prefill cond caching
-                roped_query = causal_rope_apply_cond(
-                    q, grid_sizes, freqs).type_as(v) #grid_sizes不参与计算
-                kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), seg_idx[2]-seg_idx[1])
-                kv_cache["cond_k"][:, :int(kv_cache["cond_end"])] = k[:,seg_idx[1]:seg_idx[2]]
-                kv_cache["cond_v"][:, :int(kv_cache["cond_end"])] = v[:,seg_idx[1]:seg_idx[2]]
-                x = attention(
-                    q=roped_query[:,seg_idx[1]:seg_idx[2]],
-                    k=causal_rope_apply_cond(
-                            k, grid_sizes, freqs
-                        ).type_as(v)[:,:int(kv_cache["cond_end"])],
-                    v=kv_cache["cond_v"][:, :int(kv_cache["cond_end"])],
-                    k_lens=torch.tensor(int(kv_cache["cond_end"])).repeat(b),
-                    window_size=self.window_size
-                )
+                x = flash_attention(
+                    q=roped_query[:, seg_idx[0]:seg_idx[1]],
+                    k=k_cat, v=v_cat,
+                    k_lens=k_lens,
+                    window_size=self.window_size)
             else:
-                assert False, "segment index is invalid"
+                # Scalar path
+                active_kv_cache_start = 0
+                if current_start >= kv_cache['k'].shape[1]:
+                    assert self.local_attn_size == -1, "local_attn_size should be -1 for streaming inference"
+                    current_start = current_start % kv_cache['k'].shape[1]
+                    active_kv_cache_size = kv_cache['k'].shape[1]
+                    active_cond_cache_size = int(kv_cache["cond_end"])
+                else:
+                    active_kv_cache_size = current_start + seg_len_block
+                    if self.local_attn_size != -1:
+                        active_kv_cache_start = max(0, active_kv_cache_size - self.local_attn_size * seg_len_block // 3)
+                    active_cond_cache_size = int(kv_cache["cond_end"])
+
+                kv_cache["k"][:, current_start:(current_start+seg_len_block)] = roped_key[:, seg_idx[0]:seg_idx[1]]
+                kv_cache["v"][:, current_start:(current_start+seg_len_block)] = v[:, seg_idx[0]:seg_idx[1]]
+                x = attention(
+                    q=roped_query[:, seg_idx[0]:seg_idx[1]],
+                    k=torch.cat([
+                        kv_cache["k"][:, active_kv_cache_start:active_kv_cache_size],
+                        causal_rope_apply_cond(
+                            kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
+                        ).type_as(v)
+                    ], dim=1),
+                    v=torch.cat([
+                        kv_cache["v"][:, active_kv_cache_start:active_kv_cache_size],
+                        kv_cache["cond_v"][:, :active_cond_cache_size]
+                    ], dim=1),
+                    k_lens=torch.tensor(active_kv_cache_size - active_kv_cache_start + active_cond_cache_size).repeat(b),
+                    window_size=self.window_size)
+
+        elif seg_idx[2]-seg_idx[1] > 0:  # prefill cond caching
+            roped_query = causal_rope_apply_cond(q, grid_sizes, freqs).type_as(v)
+            kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), seg_idx[2]-seg_idx[1])
+            kv_cache["cond_k"][:, :int(kv_cache["cond_end"])] = k[:, seg_idx[1]:seg_idx[2]]
+            kv_cache["cond_v"][:, :int(kv_cache["cond_end"])] = v[:, seg_idx[1]:seg_idx[2]]
+            x = attention(
+                q=roped_query[:, seg_idx[1]:seg_idx[2]],
+                k=causal_rope_apply_cond(
+                    k, grid_sizes, freqs
+                ).type_as(v)[:, :int(kv_cache["cond_end"])],
+                v=kv_cache["cond_v"][:, :int(kv_cache["cond_end"])],
+                k_lens=torch.tensor(int(kv_cache["cond_end"])).repeat(b),
+                window_size=self.window_size)
+
+        else:
+            raise ValueError("segment index is invalid: no noisy or conditioning tokens")
 
         # output
         x = x.flatten(2)
@@ -616,9 +425,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         self.zero_timestep = zero_timestep  # Whether to assign 0 value timestep to ref/motion
 
-        # init motioner
-        if enable_motioner:
-            assert False
         self.add_last_motion = add_last_motion
 
         self.enable_framepack = enable_framepack
@@ -693,27 +499,17 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                       add_last_motion=True,
                       rollout_num_frames=0,
                       sequence_current_start=0):
-        # inject the motion frames token to the hidden states
-        if self.enable_motioner:
-            assert False
-            mot, mot_remb = self.process_motion_transformer_motioner(
-                motion_latents,
-                drop_motion_frames=drop_motion_frames,
-                add_last_motion=add_last_motion)
-        elif self.enable_framepack:
-            mot, mot_remb, motion_rope_cache = self.process_motion_frame_pack(
-                motion_latents,
-                drop_motion_frames=drop_motion_frames,
-                drop_part_motion_frames=drop_part_motion_frames,
-                motion_frames=motion_frames,
-                num_frames=num_frames,
-                add_last_motion=add_last_motion,
-                rollout_num_frames=rollout_num_frames,
-                sequence_current_start_frames=sequence_current_start)
-        else:
-            assert False
-            mot, mot_remb = self.process_motion(
-                motion_latents, drop_motion_frames=drop_motion_frames)
+        # Encode motion latents via FramePack into compressed tokens
+        assert self.enable_framepack, "only FramePack motion injection is supported"
+        mot, mot_remb, motion_rope_cache = self.process_motion_frame_pack(
+            motion_latents,
+            drop_motion_frames=drop_motion_frames,
+            drop_part_motion_frames=drop_part_motion_frames,
+            motion_frames=motion_frames,
+            num_frames=num_frames,
+            add_last_motion=add_last_motion,
+            rollout_num_frames=rollout_num_frames,
+            sequence_current_start_frames=sequence_current_start)
 
         if len(mot) > 0:
             x = [torch.cat([u, m], dim=1) for u, m in zip(x, mot)]
@@ -847,23 +643,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
                                        KV_LEN=total_length + padded_length, _compile=False, device=device)
-        
-        
-        num_frames = 21
-        frame_seqlen = 384
-        motion_and_ref_seqlen = 960
-        heads = 4
-        # block_mask = prepare_blockwise_causal_attn_mask(device="cuda", num_frames=num_frames, frame_seqlen=frame_seqlen, num_frame_per_block=1, motion_and_ref_seqlen=motion_and_ref_seqlen)
-        seq_len = math.ceil((num_frames*frame_seqlen+motion_and_ref_seqlen)/128)*128
-        q = torch.randn(2, heads,seq_len, 128).to("cuda")
-        k = q.clone()
-        v = q.clone()
-
-        import torch.distributed as dist
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(
-                f" cache a block wise causal mask with block size of {num_frame_per_block} frames")
-            print(block_mask)
 
         return block_mask
 
@@ -886,20 +665,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             current_start: int = 0,
             current_end: int = 0,
             sequence_current_start: int = 0,
-            *extra_args,
-            **extra_kwargs):
-        
-        # temporarily disable context parallel
-        # sp_state = self.use_context_parallel
-        # sp_size_state = self.sp_size
-        # if self.use_context_parallel:
-        #     for block in self.blocks:
-        #         block.self_attn.forward = types.MethodType(
-        #             CausalWanS2VSelfAttention.forward, block.self_attn)
-        #         block.sp_size = 1
-        # self.use_context_parallel = False
-        # self.sp_size = 1
-
+            ):
 
         bs = x.__len__()
         _,nf,height,width = x[0].shape
@@ -962,8 +728,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         self.rope_cache['cond_shape'] = x.detach().view(b, s, n, d).shape
         self.rope_cache['grid_sizes'] = grid_sizes
         self.pre_compute_freqs = rope_precompute(
-            # x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None, start_frame=current_start // frame_seqlen )  #TODO: start_frame = current_start // hw
-            x.detach().view(b, s, n, d), rollout_grid_sizes(grid_sizes,current_start // frame_seqlen), self.freqs, start=None )
+            x.detach().view(b, s, n, d), rollout_grid_sizes(grid_sizes, current_start // frame_seqlen), self.freqs, start=None)
 
         x = [u.unsqueeze(0) for u in x]
         self.pre_compute_freqs = [
@@ -1008,8 +773,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             ],
                             dim=3) # [b,F,6,2,dim]
             e0 = [e0, self.original_seq_len]
-        else:
-            assert False
 
         # context
         context_lens = None
@@ -1020,16 +783,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
-        # grad ckpt args
-        def create_custom_forward(module, return_dict=None):
-
-            def custom_forward(*inputs, **kwargs):
-                if return_dict is not None:
-                    return module(*inputs, **kwargs, return_dict=return_dict)
-                else:
-                    return module(*inputs, **kwargs)
-
-            return custom_forward
         if self.use_context_parallel:
             global_rank = get_rank()
             model_sp_size = self.sp_size 
@@ -1056,39 +809,19 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             sp_size=self.sp_size,
             in_sink_forward=True,
             )
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
 
         for idx, block in enumerate(self.blocks):
-            kwargs.update(
-                {
-                    "kv_cache": kv_cache[idx],
-                    "crossattn_cache": crossattn_cache[idx],
-                    "current_start": current_start,
-                    "current_end": current_end
-                }
-            )
+            kwargs.update({
+                "kv_cache": kv_cache[idx],
+                "crossattn_cache": crossattn_cache[idx],
+                "current_start": current_start,
+                "current_end": current_end,
+            })
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
+                    block, x, **kwargs, use_reentrant=False)
             else:
-                if torch.is_grad_enabled():
-                    print("not checkpoint!!")
                 x = block(x, **kwargs)
-
-        # reset sp_size and use_context_parallel
-        # self.use_context_parallel = sp_state
-        # self.sp_size = sp_size_state
-        # if sp_state:
-        #     for block in self.blocks:
-        #         block.self_attn.forward = types.MethodType(
-        #             sp_attn_forward_s2v, block.self_attn)
-        #         block.sp_size = sp_size_state
 
         return [n for n in torch.zeros_like(cond_states)]
 
@@ -1112,9 +845,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             current_start: int = 0,
             current_end: int = 0,
             sequence_current_start: int = 0,
-            mask=None,
-            *extra_args,
-            **extra_kwargs):
+            mask=None):
         """
         x:                  A list of videos each with shape [C=16, T=20, H, W].                                                            list(bs):torch.Size([16, 20, 48, 32])
         t:                  [B,F].torch.Size([1,F])                                                                                          torch.Size([bs,F])
@@ -1176,7 +907,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         b, s, n, d = x.size(0), x.size(
             1), self.num_heads, self.dim // self.num_heads
 
-        import random
         if isinstance(current_start, torch.Tensor) and b > 1:
             # Per-batch RoPE for batched pipeline
             frame_seqlen_int = int(frame_seqlen)
@@ -1220,8 +950,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             num_frames_cond_rollout = max(0, cs_scalar // frame_seqlen - start_idx)
             cond_pre_compute_freqs = rope_precompute(
                 torch.empty(self.rope_cache['cond_shape']).type_as(x), rollout_grid_sizes(self.rope_cache['grid_sizes'], num_frames_cond_rollout), self.freqs, start=None)
-        # print(f"current_grid_size:{rollout_grid_sizes(grid_sizes,current_start // frame_seqlen)}")
-        # print(f"cond grid_size:{rollout_grid_sizes(self.rope_cache['grid_sizes'],num_frames_cond_rollout)}")
         mask_input = torch.zeros([1,x.shape[1]], dtype=torch.long, device=x.device)
         x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
 
@@ -1238,20 +966,14 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         
         if self.zero_timestep:
-            e = e[:-1*t.shape[1]] # [bF,dim]
-            zero_e0 = e0[-1:] # [1,F,6,dim]
-            e0 = e0[:-1] # [b,F,6,dim]
-            token_len = x.shape[1]
+            e = e[:-1*t.shape[1]]
+            zero_e0 = e0[-1:]
+            e0 = e0[:-1]
             e0 = torch.cat([
-                e0.unsqueeze(3), # [b,F,6,1,dim]
-                zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1,1, 1) # [b,F,6,1,dim]
-            ],
-                            dim=3) # [b,F,6,2,dim]
+                e0.unsqueeze(3),
+                zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1, 1, 1),
+            ], dim=3)  # [B, F, 6, 2, dim]
             e0 = [e0, self.original_seq_len]
-        else:
-            assert False
-            e0 = e0.unsqueeze(3).repeat(1, 1, 1, 2, 1) # [b,F,6,2,dim]
-            e0 = [e0, 0]
 
         # context
         context_lens = None
@@ -1262,33 +984,16 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
-        # grad ckpt args
-        def create_custom_forward(module, return_dict=None):
-
-            def custom_forward(*inputs, **kwargs):
-                if return_dict is not None:
-                    return module(*inputs, **kwargs, return_dict=return_dict)
-                else:
-                    return module(*inputs, **kwargs)
-
-            return custom_forward
-
         if self.use_context_parallel:
-            # sharded tensors for long context attn
             global_rank = get_rank()
-            model_sp_size = self.sp_size 
-            sp_rank = global_rank % model_sp_size  # rank within sequence parallel group
-
+            model_sp_size = self.sp_size
+            sp_rank = global_rank % model_sp_size
             x, orig_seq_len = pad_chunk(x, model_sp_size, dim=1)
             sq_start_size = int(x.shape[1] * sp_rank)
-
             seg_idx = e0[1] - sq_start_size
             e0[1] = seg_idx
             self.pre_compute_freqs, _ = pad_chunk(self.pre_compute_freqs, model_sp_size, dim=1)
 
-        # arguments
-        # seq_lens is uniform across batch (same resolution); use scalar for
-        # downstream .repeat() calls that expect int
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens[0],
@@ -1300,33 +1005,21 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
-            )
-
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
+        )
 
         for idx, block in enumerate(self.blocks):
-            kwargs.update(
-                {
-                    "kv_cache": kv_cache[idx],
-                    "crossattn_cache": crossattn_cache[idx],
-                    "current_start": current_start,
-                    "current_end": current_end,
-                    "freqs_cond": cond_pre_compute_freqs
-                }
-            )
+            kwargs.update({
+                "kv_cache": kv_cache[idx],
+                "crossattn_cache": crossattn_cache[idx],
+                "current_start": current_start,
+                "current_end": current_end,
+                "freqs_cond": cond_pre_compute_freqs,
+            })
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
+                    block, x, **kwargs, use_reentrant=False)
                 x = self.after_transformer_block(idx, x)
             else:
-                if torch.is_grad_enabled():
-                    print("not checkpoint!!")
                 x = block(x, **kwargs)
                 x = self.after_transformer_block(idx, x, mask)
 
@@ -1354,9 +1047,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             motion_frames=[17, 5],
             add_last_motion=2,
             drop_motion_frames=False,
-            drop_part_motion_frames=False,
-            *extra_args,
-            **extra_kwargs):
+            drop_part_motion_frames=False):
         """
         x:                  A list of videos each with shape [C, T, H, W].
         t:                  [B,F].
@@ -1494,20 +1185,14 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
         
         if self.zero_timestep:
-            e = e[:-1*t.shape[1]] # [bF,dim]
-            zero_e0 = e0[-1:] # [1,F,6,dim]
-            e0 = e0[:-1] # [b,F,6,dim]
-            token_len = x.shape[1]
+            e = e[:-1*t.shape[1]]
+            zero_e0 = e0[-1:]
+            e0 = e0[:-1]
             e0 = torch.cat([
-                e0.unsqueeze(3), # [b,F,6,1,dim]
-                zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1,1, 1) # [b,F,6,1,dim]
-            ],
-                            dim=3) # [b,F,6,2,dim]
+                e0.unsqueeze(3),
+                zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1, 1, 1),
+            ], dim=3)  # [B, F, 6, 2, dim]
             e0 = [e0, self.original_seq_len]
-        else:
-            assert False
-            e0 = e0.unsqueeze(3).repeat(1, 1, 1, 2, 1) # [b,F,6,2,dim]
-            e0 = [e0, 0]
 
         # context
         context_lens = None
@@ -1518,70 +1203,38 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
-        # grad ckpt args
-        def create_custom_forward(module, return_dict=None):
-
-            def custom_forward(*inputs, **kwargs):
-                if return_dict is not None:
-                    return module(*inputs, **kwargs, return_dict=return_dict)
-                else:
-                    return module(*inputs, **kwargs)
-
-            return custom_forward
-
         if self.use_context_parallel:
-            # sharded tensors for long context attn
             global_rank = get_rank()
-            model_sp_size = self.sp_size 
-            sp_rank = global_rank % model_sp_size  # rank within sequence parallel group
-
+            model_sp_size = self.sp_size
+            sp_rank = global_rank % model_sp_size
             x = torch.chunk(x, model_sp_size, dim=1)
             sq_size = [u.shape[1] for u in x]
             sq_start_size = sum(sq_size[:sp_rank])
             x = x[sp_rank]
-
             seg_idx = e0[1] - sq_start_size
             e0[1] = seg_idx
-
             self.pre_compute_freqs = torch.chunk(
-                self.pre_compute_freqs, model_sp_size, dim=1)
-            self.pre_compute_freqs = self.pre_compute_freqs[sp_rank]
+                self.pre_compute_freqs, model_sp_size, dim=1)[sp_rank]
 
-        # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
             freqs=self.pre_compute_freqs,
             context=context,
-            context_lens=context_lens,        
+            context_lens=context_lens,
             block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
-            )
-
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
+        )
 
         for idx, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
-                # x = torch.utils.checkpoint.checkpoint(
-                #     create_custom_forward(self.after_transformer_block),
-                #     idx, x,
-                #     use_reentrant=False,
-                # )
+                    block, x, **kwargs, use_reentrant=False)
                 x = self.after_transformer_block(idx, x)
             else:
-                if torch.is_grad_enabled():
-                    print("not checkpoint!!")
                 x = block(x, **kwargs)
                 x = self.after_transformer_block(idx, x)
 
@@ -1595,18 +1248,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         x = self.unpatchify(x, original_grid_sizes)
         return [u for u in x]
 
-    def forward(
-        self,
-        *args,
-        **kwargs
-    ):
-        if kwargs.get('kv_cache', None) is not None:
-            if kwargs.get('sink_flag', False):
+    def forward(self, *args, **kwargs):
+        sink_flag = kwargs.pop('sink_flag', False)
+        if kwargs.get('kv_cache') is not None:
+            if sink_flag:
                 return self._forward_sink(*args, **kwargs)
-            else:
-                return self._forward_inference(*args, **kwargs)
-        else:
-            return self._forward_train(*args, **kwargs)
+            return self._forward_inference(*args, **kwargs)
+        return self._forward_train(*args, **kwargs)
 
     def unpatchify(self, x, grid_sizes):
         """
