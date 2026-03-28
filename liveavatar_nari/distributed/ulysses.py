@@ -5,13 +5,14 @@ import torch.distributed as dist
 from ..modules.attention import flash_attention
 from .util import all_to_all
 
+
 def distributed_attention(
-        q,
-        k,
-        v,
-        seq_lens,
-        window_size=(-1, -1),
-        sp_size=None,
+    q,
+    k,
+    v,
+    seq_lens,
+    window_size=(-1, -1),
+    sp_size=None,
 ):
     """
     Performs distributed attention based on DeepSpeed Ulysses attention mechanism.
@@ -30,9 +31,9 @@ def distributed_attention(
     b = q.shape[0]
 
     # gather q/k/v sequence
-    q = all_to_all(q, scatter_dim=2, gather_dim=1,sp_size=sp_size)
-    k = all_to_all(k, scatter_dim=2, gather_dim=1,sp_size=sp_size)
-    v = all_to_all(v, scatter_dim=2, gather_dim=1,sp_size=sp_size)
+    q = all_to_all(q, scatter_dim=2, gather_dim=1, sp_size=sp_size)
+    k = all_to_all(k, scatter_dim=2, gather_dim=1, sp_size=sp_size)
+    v = all_to_all(v, scatter_dim=2, gather_dim=1, sp_size=sp_size)
 
     sp_full_length = k.shape[1]
 
@@ -45,15 +46,23 @@ def distributed_attention(
         window_size=window_size,
     )
 
-    x = torch.cat([x, torch.zeros([b, sp_full_length-x.shape[1], x.shape[2], x.shape[3]],
-                        device=x.device, dtype=x.dtype)],
-        dim=1)
-    pad_len = sp_full_length-x.shape[1]
+    x = torch.cat(
+        [
+            x,
+            torch.zeros(
+                [b, sp_full_length - x.shape[1], x.shape[2], x.shape[3]],
+                device=x.device,
+                dtype=x.dtype,
+            ),
+        ],
+        dim=1,
+    )
+    pad_len = sp_full_length - x.shape[1]
     pad_shape = list(x.shape)
     pad_shape[1] = pad_len
     pad_x = torch.zeros(pad_shape).type_as(x)
     x = torch.cat([x, pad_x], dim=1)
 
     # scatter q/k/v sequence
-    x = all_to_all(x, scatter_dim=1, gather_dim=2,sp_size=sp_size)
+    x = all_to_all(x, scatter_dim=1, gather_dim=2, sp_size=sp_size)
     return x

@@ -1,4 +1,5 @@
 """CLI entry point for LiveAvatar inference."""
+
 import argparse
 import os
 import time
@@ -24,10 +25,17 @@ def parse_args():
     p.add_argument("--seed", type=int, default=-1, help="Random seed (-1=random)")
     # Hardware
     p.add_argument("--fp8", action="store_true", help="Enable FP8 quantization")
-    p.add_argument("--offload_model", default=True, type=lambda x: x.lower() != 'false',
-                    help="Offload models to CPU between stages")
-    p.add_argument("--offload_kv_cache", action="store_true",
-                    help="Offload KV cache to CPU between forward passes")
+    p.add_argument(
+        "--offload_model",
+        default=True,
+        type=lambda x: x.lower() != "false",
+        help="Offload models to CPU between stages",
+    )
+    p.add_argument(
+        "--offload_kv_cache",
+        action="store_true",
+        help="Offload KV cache to CPU between forward passes",
+    )
     # Output
     p.add_argument("--output", default="output/result.mp4", help="Output video path")
     p.add_argument("--fps", type=int, default=25, help="Output video FPS")
@@ -42,11 +50,13 @@ def main():
     import torch
 
     from liveavatar_nari.config import load_config
+
     cfg = load_config(args.config)
     t_config = time.perf_counter()
     print(f"[TIMING] Load config: {t_config - t_start:.2f}s")
 
     from liveavatar_nari.pipeline import WanS2V
+
     t_import = time.perf_counter()
     print(f"[TIMING] Import pipeline: {t_import - t_config:.2f}s")
 
@@ -65,10 +75,11 @@ def main():
         print(f"Loading LoRA from {args.load_lora} (rank={lora_cfg['lora_rank']})")
         pipeline.load_lora(
             lora_path=args.load_lora,
-            lora_rank=lora_cfg['lora_rank'],
-            lora_alpha=lora_cfg['lora_alpha'],
-            lora_target_modules=lora_cfg['lora_target_modules'],
-            init_lora_weights=lora_cfg['init_lora_weights'])
+            lora_rank=lora_cfg["lora_rank"],
+            lora_alpha=lora_cfg["lora_alpha"],
+            lora_target_modules=lora_cfg["lora_target_modules"],
+            init_lora_weights=lora_cfg["init_lora_weights"],
+        )
 
     # Save merged model if requested
     if args.save_merged:
@@ -80,20 +91,26 @@ def main():
         if hasattr(torch, "_scaled_mm"):
             print("Applying FP8 quantization...")
             from liveavatar_nari.utils.fp8_linear import replace_linear_with_scaled_fp8
+
             replace_linear_with_scaled_fp8(
                 pipeline.noise_model,
                 ignore_keys=[
-                    'text_embedding', 'time_embedding',
-                    'time_projection', 'head.head',
-                    'casual_audio_encoder.encoder.final_linear',
-                ])
+                    "text_embedding",
+                    "time_embedding",
+                    "time_projection",
+                    "head.head",
+                    "casual_audio_encoder.encoder.final_linear",
+                ],
+            )
         else:
             print("WARNING: torch._scaled_mm not available, skipping FP8")
 
     # Generate
     print(f"Generating: image={args.image}, audio={args.audio}")
-    print(f"  infer_frames={args.infer_frames}, num_clip={args.num_clip}, "
-          f"sample_steps={args.sample_steps}, seed={args.seed}")
+    print(
+        f"  infer_frames={args.infer_frames}, num_clip={args.num_clip}, "
+        f"sample_steps={args.sample_steps}, seed={args.seed}"
+    )
 
     video, _ = pipeline.generate(
         input_prompt=args.prompt,
@@ -110,6 +127,7 @@ def main():
     # Save video
     if video is not None:
         from liveavatar_nari.utils.video import save_video, merge_video_audio
+
         os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         save_video(
             tensor=video[None],
@@ -117,7 +135,8 @@ def main():
             fps=args.fps,
             nrow=1,
             normalize=True,
-            value_range=(-1, 1))
+            value_range=(-1, 1),
+        )
         merge_video_audio(video_path=args.output, audio_path=args.audio)
         print(f"Saved: {args.output}")
     else:

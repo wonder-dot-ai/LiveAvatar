@@ -1,10 +1,12 @@
 """Lightweight config loader — no torch/diffusers/transformers imports."""
+
 import yaml
 import torch
 
 
 class _DotDict(dict):
     """Dict with attribute access (EasyDict replacement)."""
+
     def __getattr__(self, key):
         try:
             return self[key]

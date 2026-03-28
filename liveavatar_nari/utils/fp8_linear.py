@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import logging
+
 logger = logging.getLogger()
 
 
@@ -18,13 +19,13 @@ class FP8LinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias, max_input_val, max_weight_val):
         """
-        input: [B, *, in_features]  (可以是 2D 或 3D)
+        input: [B, *, in_features]  (2D or 3D)
         weight: [out_features, in_features]
-        bias: [out_features] 或 None
+        bias: [out_features] or None
         """
-        prev_shape = input.shape  # 保存原始形状
+        prev_shape = input.shape
 
-        # ===== 权重量化 =====
+        # ===== Weight quantization =====
         if isinstance(weight, tuple):
             input_2d = input.view(-1, weight[0].shape[1])
             weight_fp8, weight_scale = weight
@@ -34,7 +35,7 @@ class FP8LinearFunction(torch.autograd.Function):
             weight_fp8, weight_scale = quant_fp8(weight)
             out_feature = weight.shape[0]
 
-        # ===== 输入量化 (PerTensor) =====
+        # ===== Input quantization (PerTensor) =====
         input_fp8, input_scale = quant_fp8(input_2d, torch.float8_e4m3fn)
 
         # ===== FP8 matmul =====
@@ -48,7 +49,7 @@ class FP8LinearFunction(torch.autograd.Function):
             use_fast_accum=True,
         )
 
-        # 恢复成原来的 batch/seq 形状
+        # Restore original batch/seq shape
         if isinstance(out_2d, tuple):
             out_2d = out_2d[0]
         out = out_2d.view(*prev_shape[:-1], out_feature)
@@ -82,12 +83,14 @@ class FP8ScaleLinear(nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def quantize_weight(self,):
+    def quantize_weight(
+        self,
+    ):
         fp8_data, scale = quant_fp8(self.weight.detach())
         self.register_buffer("weight_fp8", fp8_data)
         self.register_buffer("weight_scale", scale)
-        meta_w = torch.empty(self.weight.shape, device='meta', dtype=self.weight.dtype)
-        self._parameters.pop('weight')
+        meta_w = torch.empty(self.weight.shape, device="meta", dtype=self.weight.dtype)
+        self._parameters.pop("weight")
         self.weight = meta_w
         self.quantized_weight = True
 
@@ -97,7 +100,7 @@ class FP8ScaleLinear(nn.Module):
             in_features=linear.in_features,
             out_features=linear.out_features,
             bias=(linear.bias is not None),
-            dtype=linear.weight.dtype
+            dtype=linear.weight.dtype,
         )
         new_layer = new_layer.to(linear.weight.device)
         with torch.no_grad():
@@ -113,16 +116,12 @@ class FP8ScaleLinear(nn.Module):
             W_eff = (self.weight_fp8, self.weight_scale)
         else:
             W_eff = self.weight
-        return FP8LinearFunction.apply(
-            input, W_eff, self.bias, self.max_input_val, self.max_weight_val)
+        return FP8LinearFunction.apply(input, W_eff, self.bias, self.max_input_val, self.max_weight_val)
 
 
 def contains_substring(str_list, target_str):
     """
-    检测 str_list 中是否存在某个字符串被包含在 target_str 中
-    :param str_list: list[str]  要检测的字符串列表
-    :param target_str: str      指定的字符串
-    :return: bool                存在则返回 True，否则 False
+    Check if any string in str_list is a substring of target_str.
     """
     for s in str_list:
         if s in target_str:
@@ -138,6 +137,10 @@ def replace_linear_with_scaled_fp8(module: nn.Module, ignore_keys=[], quantize_w
 
     for name, child in module.named_children():
         if isinstance(child, nn.Linear) and not hasattr(child, "need_fp8"):
-            setattr(module, name, FP8ScaleLinear.from_linear(child, quantize_weight=quantize_weight))
+            setattr(
+                module,
+                name,
+                FP8ScaleLinear.from_linear(child, quantize_weight=quantize_weight),
+            )
         else:
             replace_linear_with_scaled_fp8(child, quantize_weight=quantize_weight)

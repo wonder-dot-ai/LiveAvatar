@@ -1,6 +1,8 @@
 #!/bin/bash
 # Inference using liveavatar_nari package (pre-merged checkpoint)
 
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
 CUDA_VISIBLE_DEVICES=0 liveavatar-infer \
     --image "examples/dwarven_blacksmith.jpg" \
     --audio "examples/dwarven_blacksmith.wav" \
@@ -9,7 +11,7 @@ CUDA_VISIBLE_DEVICES=0 liveavatar-infer \
     --fp8 \
     --offload_model True \
     --infer_frames 48 \
-    --num_clip 1 \
+    --num_clip 100 \
     --sample_steps 4 \
     --seed 4200 \
-    --output output/result_nari.mp4
+    --output "output/result_nari_${TIMESTAMP}.mp4"

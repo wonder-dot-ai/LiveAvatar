@@ -16,7 +16,7 @@ dependencies = [
     "diffusers>=0.37",
     "transformers",
     "huggingface_hub",
-    "imageio",
+    "imageio[ffmpeg]",
     "pyyaml",
     "librosa",
     "einops",
@@ -38,6 +38,12 @@ find-links = [
 extra-index-url = [
     "https://download.pytorch.org/whl/cu128",
 ]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
 
 [tool.setuptools.packages.find]
 include = ["liveavatar_nari*"]

@@ -6,13 +6,14 @@ import hashlib
 from .args_config import args
 from huggingface_hub import hf_hub_download
 
+
 @contextmanager
-def init_weights_on_device(device = torch.device("meta"), include_buffers :bool = False):
-    
+def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = False):
+
     old_register_parameter = torch.nn.Module.register_parameter
     if include_buffers:
         old_register_buffer = torch.nn.Module.register_buffer
-    
+
     def register_empty_parameter(module, name, param):
         old_register_parameter(module, name, param)
         if param is not None:
@@ -25,14 +26,14 @@ def init_weights_on_device(device = torch.device("meta"), include_buffers :bool 
         old_register_buffer(module, name, buffer, persistent=persistent)
         if buffer is not None:
             module._buffers[name] = module._buffers[name].to(device)
-            
+
     def patch_tensor_constructor(fn):
         def wrapper(*args, **kwargs):
             kwargs["device"] = device
             return fn(*args, **kwargs)
 
         return wrapper
-    
+
     if include_buffers:
         tensor_constructors_to_patch = {
             torch_function_name: getattr(torch, torch_function_name)
@@ -40,26 +41,38 @@ def init_weights_on_device(device = torch.device("meta"), include_buffers :bool 
         }
     else:
         tensor_constructors_to_patch = {}
-    
+
     try:
         torch.nn.Module.register_parameter = register_empty_parameter
         if include_buffers:
             torch.nn.Module.register_buffer = register_empty_buffer
         for torch_function_name in tensor_constructors_to_patch.keys():
-            setattr(torch, torch_function_name, patch_tensor_constructor(getattr(torch, torch_function_name)))
+            setattr(
+                torch,
+                torch_function_name,
+                patch_tensor_constructor(getattr(torch, torch_function_name)),
+            )
         yield
     finally:
         torch.nn.Module.register_parameter = old_register_parameter
         if include_buffers:
             torch.nn.Module.register_buffer = old_register_buffer
-        for torch_function_name, old_torch_function in tensor_constructors_to_patch.items():
+        for (
+            torch_function_name,
+            old_torch_function,
+        ) in tensor_constructors_to_patch.items():
             setattr(torch, torch_function_name, old_torch_function)
+
 
 def load_state_dict_from_folder(file_path, torch_dtype=None):
     state_dict = {}
     for file_name in os.listdir(file_path):
         if "." in file_name and file_name.split(".")[-1] in [
-            "safetensors", "bin", "ckpt", "pth", "pt"
+            "safetensors",
+            "bin",
+            "ckpt",
+            "pth",
+            "pt",
         ]:
             state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
     return state_dict
@@ -76,7 +89,7 @@ def load_state_dict(file_path, torch_dtype=None):
                     repo_id=file_path,
                     filename="liveavatar.safetensors",
                     local_files_only=False,
-                    cache_dir="ckpt/LiveAvatar"
+                    cache_dir="ckpt/LiveAvatar",
                 )
                 return load_state_dict_from_safetensors(actual_path, torch_dtype=torch_dtype)
             except Exception as e:
@@ -84,7 +97,7 @@ def load_state_dict(file_path, torch_dtype=None):
                 actual_path = file_path
     else:
         actual_path = file_path
-    
+
     if actual_path.endswith(".safetensors"):
         return load_state_dict_from_safetensors(actual_path, torch_dtype=torch_dtype)
     else:
@@ -109,6 +122,7 @@ def load_state_dict_from_bin(file_path, torch_dtype=None):
                 state_dict[i] = state_dict[i].to(torch_dtype)
     return state_dict
 
+
 def smart_load_weights(model, ckpt_state_dict):
     model_state_dict = model.state_dict()
     new_state_dict = {}
@@ -119,10 +133,10 @@ def smart_load_weights(model, ckpt_state_dict):
             if param.shape == ckpt_param.shape:
                 new_state_dict[name] = ckpt_param
             else:
-                # 自动修剪维度以匹配
+                # Auto-trim dimensions to match
                 if all(p >= c for p, c in zip(param.shape, ckpt_param.shape)):
                     print(f"[Truncate] {name}: ckpt {ckpt_param.shape} -> model {param.shape}")
-                    # 创建新张量，拷贝旧数据
+                    # Create new tensor and copy old data
                     new_param = param.clone()
                     slices = tuple(slice(0, s) for s in ckpt_param.shape)
                     new_param[slices] = ckpt_param
@@ -130,9 +144,10 @@ def smart_load_weights(model, ckpt_state_dict):
                 else:
                     print(f"[Skip] {name}: ckpt {ckpt_param.shape} is larger than model {param.shape}")
 
-    # 更新 state_dict，只更新那些匹配的
+    # Update state_dict with matched keys only
     missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, assign=True, strict=False)
     return model, missing_keys, unexpected_keys
+
 
 def search_for_embeddings(state_dict):
     embeddings = []
@@ -164,11 +179,16 @@ def build_rename_dict(source_state_dict, target_state_dict, split_qkv=False):
             if rename is not None:
                 print(f'"{name}": "{rename}",')
                 matched_keys.add(rename)
-            elif split_qkv and len(source_state_dict[name].shape)>=1 and source_state_dict[name].shape[0]%3==0:
+            elif split_qkv and len(source_state_dict[name].shape) >= 1 and source_state_dict[name].shape[0] % 3 == 0:
                 length = source_state_dict[name].shape[0] // 3
                 rename = []
                 for i in range(3):
-                    rename.append(search_parameter(source_state_dict[name][i*length: i*length+length], target_state_dict))
+                    rename.append(
+                        search_parameter(
+                            source_state_dict[name][i * length : i * length + length],
+                            target_state_dict,
+                        )
+                    )
                 if None not in rename:
                     print(f'"{name}": {rename},')
                     for rename_ in rename:
@@ -210,7 +230,7 @@ def convert_state_dict_keys_to_single_str(state_dict, with_shape=True):
 def split_state_dict_with_prefix(state_dict):
     keys = sorted([key for key in state_dict if isinstance(key, str)])
     prefix_dict = {}
-    for key in  keys:
+    for key in keys:
         prefix = key if "." not in key else key.split(".")[0]
         if prefix not in prefix_dict:
             prefix_dict[prefix] = []
