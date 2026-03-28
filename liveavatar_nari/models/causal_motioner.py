@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.utils import BaseOutput, is_torch_version
@@ -20,7 +19,7 @@ from ..modules.s2v.s2v_utils import rope_precompute
 from .causal_s2v_utils import rollout_grid_sizes
 
 
-@amp.autocast(enabled=False)
+@torch.amp.autocast("cuda", enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(

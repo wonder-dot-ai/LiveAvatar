@@ -3,7 +3,6 @@ import math
 from typing import Tuple, Union
 
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.models.attention import AdaLayerNorm
 
@@ -29,7 +28,7 @@ class CausalAudioEncoder(nn.Module):
         self.act = torch.nn.SiLU()
 
     def forward(self, features):
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             # features B * num_layers * dim * video_length
             weights = self.act(self.weights)
             weights_sum = weights.sum(dim=1, keepdims=True)

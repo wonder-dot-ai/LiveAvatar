@@ -6,7 +6,6 @@ from copy import deepcopy
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -64,7 +63,7 @@ class CausalHead_S2V(Head):
         original_dtype = x.dtype
         batch_size, num_frames = x.shape[0], e.shape[0] // x.shape[0]
         frame_seqlen = x.shape[1] // num_frames
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = self.head(
                 (
@@ -287,7 +286,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         e = e[0]  # [B, F, 6, 2, C]
 
         modulation = self.modulation.unsqueeze(1).unsqueeze(3)  # [1, 6, 5120]->[1, 1, 6, 1, 5120]
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             e = (modulation + e).chunk(6, dim=2)  # [B,F,6,2,dim]->tuple(6)*[B,F,1,2,dim]
         assert e[0].dtype == torch.float32
 
@@ -328,7 +327,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
             freqs_cond,
         )  # [b,l,dim]
 
-        with amp.autocast(dtype=torch.float32):
+        with torch.amp.autocast("cuda", dtype=torch.float32):
             y = y * e[2]
             x = x + y
 
@@ -344,7 +343,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
 
             y = self.ffn(norm2_x.type_as(bf_dtype_tensor))
 
-            with amp.autocast(dtype=torch.float32):
+            with torch.amp.autocast("cuda", dtype=torch.float32):
                 y = y * e[5]
                 x = x + y
             return x
@@ -753,6 +752,101 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         return block_mask
 
+    # ── shared helpers (Step 4) ──────────────────────────────────────────
+
+    def _encode_audio(self, audio_input, motion_frames):
+        """Encode audio input via CausalAudioEncoder, store results as instance attrs."""
+        audio_input = torch.cat(
+            [audio_input[..., 0:1].repeat(1, 1, 1, int(motion_frames[0])), audio_input],
+            dim=-1,
+        )
+        audio_emb_res = self.casual_audio_encoder(audio_input)
+        audio_emb_res = tuple(aa.to(self.dtype) for aa in audio_emb_res)
+        if self.enbale_adain:
+            audio_emb_global, audio_emb = audio_emb_res
+            self.audio_emb_global = audio_emb_global[:, motion_frames[1] :].clone()
+        else:
+            audio_emb = audio_emb_res
+        self.merged_audio_emb = audio_emb[:, motion_frames[1] :, :]
+
+    def _embed_patches_with_pose(self, x, cond_states):
+        """Patch-embed noisy latents and add pose conditioning."""
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
+        return [x_ + c for x_, c in zip(x, cond)]
+
+    def _flatten_to_sequence(self, x):
+        """Flatten patch-embedded tensors to sequence form and compute grid metadata."""
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        original_grid_sizes = deepcopy(grid_sizes)
+        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
+        num_frames = original_grid_sizes[0][0].item()
+        if num_frames > 0:
+            frame_seqlen = seq_lens[0] // num_frames
+        else:
+            frame_seqlen = grid_sizes[0][-1][:, 1:].prod()
+        return x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen
+
+    def _prepare_ref_tokens(self, ref_latents, x, seq_lens, grid_sizes):
+        """Patch-embed ref image, create ref_grid_sizes, concatenate to sequence."""
+        ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_latents]
+        batch_size = len(ref)
+        height, width = ref[0].shape[3], ref[0].shape[4]
+        ref_grid_sizes = [
+            [
+                torch.tensor([30, 0, 0]).unsqueeze(0).repeat(batch_size, 1),
+                torch.tensor([31, height, width]).unsqueeze(0).repeat(batch_size, 1),
+                torch.tensor([1, height, width]).unsqueeze(0).repeat(batch_size, 1),
+            ]
+        ]
+        ref = [r.flatten(2).transpose(1, 2) for r in ref]
+        self.original_seq_len = seq_lens[0]
+        seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref], dtype=torch.long)
+        grid_sizes = grid_sizes + ref_grid_sizes
+        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
+        return x, seq_lens, grid_sizes
+
+    def _compute_timestep_embeddings(self, t):
+        """Compute time embeddings and projections. Returns (e, e0)."""
+        if self.zero_timestep:
+            t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)])
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float())
+            e0 = self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
+            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        if self.zero_timestep:
+            e = e[: -1 * t.shape[1]]
+            zero_e0 = e0[-1:]
+            e0 = e0[:-1]
+            e0 = torch.cat(
+                [
+                    e0.unsqueeze(3),
+                    zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1, 1, 1),
+                ],
+                dim=3,
+            )
+            e0 = [e0, self.original_seq_len]
+        return e, e0
+
+    def _embed_context(self, context):
+        """Pad and embed T5 text context."""
+        return self.text_embedding(
+            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+        )
+
+    def _postprocess_output(self, x, e, original_grid_sizes):
+        """Gather context-parallel, slice to original seq_len, apply head, unpatchify."""
+        if self.use_context_parallel:
+            x = gather_forward(x.contiguous(), dim=1)
+        x = x[:, : self.original_seq_len]
+        x = self.head(x, e)
+        x = self.unpatchify(x, original_grid_sizes)
+        return [u for u in x]
+
+    # ── end shared helpers ───────────────────────────────────────────────
+
     def _forward_sink(
         self,
         x,
@@ -778,49 +872,15 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         nf = 0
         x = [torch.zeros([1, 5120, nf, height // 2, width // 2]).to(dtype=torch.bfloat16, device=x[0].device)] * bs
 
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-
-        original_grid_sizes = deepcopy(grid_sizes)
-        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
-
-        # Use original seq_len for frame_seqlen since seq_lens grows after adding motion/ref tokens
-        frame_seqlen = grid_sizes[0][-1][:, 1:].prod()
-
-        # Store grid_sizes for after_transformer_block
-        self.h_patches = original_grid_sizes[0][1].item()  # H_patches
-        self.w_patches = original_grid_sizes[0][2].item()  # W_patches
-
-        # ref and motion
+        x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
+        self.h_patches = original_grid_sizes[0][1].item()
+        self.w_patches = original_grid_sizes[0][2].item()
         self.lat_motion_frames = motion_latents[0].shape[1]
+        x, seq_lens, grid_sizes = self._prepare_ref_tokens(ref_latents, x, seq_lens, grid_sizes)
 
-        ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_latents]
-        batch_size = len(ref)
-        height, width = ref[0].shape[3], ref[0].shape[4]
-        ref_grid_sizes = [
-            [
-                torch.tensor([30, 0, 0]).unsqueeze(0).repeat(batch_size, 1),  # the start index
-                torch.tensor([31, height, width]).unsqueeze(0).repeat(batch_size, 1),  # the end index
-                torch.tensor([1, height, width]).unsqueeze(0).repeat(batch_size, 1),
-            ]  # the range
-        ]
-
-        ref = [r.flatten(2).transpose(1, 2) for r in ref]
-        self.original_seq_len = seq_lens[0]
-
-        seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref], dtype=torch.long)
-
-        grid_sizes = grid_sizes + ref_grid_sizes
-
-        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
-
-        # Initialize masks to indicate noisy latent, ref latent, and motion latent.
-        # However, at this point, only the first two (noisy and ref latents) are marked;
-        # the marking of motion latent will be implemented inside `inject_motion`.
         mask_input = [torch.ones([1, u.shape[1]], dtype=torch.long, device=x[0].device) for u in x]
 
-        # compute the rope embeddings for the input
+        # RoPE (stores to rope_cache for inference to use later)
         x = torch.cat(x)
 
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
@@ -854,63 +914,30 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
 
-        # time embeddings
-        if self.zero_timestep:
-            t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)])
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()
-            )  # t:[b+1,F], output:[(b+1)*F,dim]
-            e0 = (
-                self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-            )  # output:[b+1,F,6,dim]
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
-
-        if self.zero_timestep:
-            zero_e0 = e0[-1:]  # [1,F,6,dim]
-            e0 = e0[:-1]  # [b,F,6,dim]
-            e0 = torch.cat(
-                [
-                    e0.unsqueeze(3),  # [b,F,6,1,dim]
-                    zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1, 1, 1),  # [b,F,6,1,dim]
-                ],
-                dim=3,
-            )  # [b,F,6,2,dim]
-            e0 = [e0, self.original_seq_len]
-
-        # context
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
-        )
+        e, e0 = self._compute_timestep_embeddings(t)
+        context = self._embed_context(context)
 
         if self.use_context_parallel:
             global_rank = get_rank()
             model_sp_size = self.sp_size
-            sp_rank = global_rank % model_sp_size  # rank within sequence parallel group
-
+            sp_rank = global_rank % model_sp_size
             x, orig_seq_len = pad_chunk(x, model_sp_size, dim=1)
-            sq_start_size = int(x.shape[1] * sp_rank)
-
-            seg_idx = e0[1] - sq_start_size
-            e0[1] = seg_idx
+            e0[1] = e0[1] - int(x.shape[1] * sp_rank)
             self.pre_compute_freqs, _ = pad_chunk(self.pre_compute_freqs, model_sp_size, dim=1)
 
-        # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
             freqs=self.pre_compute_freqs,
             context=context,
-            context_lens=context_lens,
+            context_lens=None,
             block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
             in_sink_forward=True,
         )
-
         for idx, block in enumerate(self.blocks):
             kwargs.update(
                 {
@@ -948,62 +975,15 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         sequence_current_start: int = 0,
         mask=None,
     ):
-        """
-        x:                  A list of videos each with shape [C=16, T=20, H, W].                                                            list(bs):torch.Size([16, 20, 48, 32])
-        t:                  [B,F].torch.Size([1,F])                                                                                          torch.Size([bs,F])
-        context:            A list of text embeddings each with shape [L, C].                                                                 list(bs):torch.Size([19, 4096])
-        seq_len:            A list of video token lens, no need for this model.                                                                 int64
-        ref_latents         A reference image tensor (not a list) with shape [B, C, 1, H, W].
-        motion_latents      A list of  motion frames for each video with shape [C, T_m, H, W].                                                  torch.Size([bs, 16, 19, 48, 32])
-        cond_states         A list of condition frames (i.e. pose) each with shape [C, T, H, W].                                                torch.Size([bs, 16, 20, 48, 32])
-        audio_input         The input audio embedding [B, num_wav2vec_layer, C_a, T_a].                                                         torch.Size([bs, 25, 1024, 80])
-        motion_frames       The number of motion frames and motion latents frames encoded by vae, i.e.                                          [73, 19]
-        add_last_motion     For the motioner, if add_last_motion > 0, it means that the most recent frame (i.e., the last frame) will be added.
-                            For frame packing, the behavior depends on the value of add_last_motion:
-                            add_last_motion = 0: Only the farthest part of the latent (i.e., clean_latents_4x) is included.
-                            add_last_motion = 1: Both clean_latents_2x and clean_latents_4x are included.
-                            add_last_motion = 2: All motion-related latents are used.
-        drop_motion_frames  Bool, whether drop the motion frames info
-        """
+        """Streaming inference forward pass (cached KV, no ref tokens)."""
         add_last_motion = int(self.add_last_motion) * add_last_motion
-        audio_input = torch.cat(
-            [audio_input[..., 0:1].repeat(1, 1, 1, motion_frames[0]), audio_input],
-            dim=-1,
-        )
-        audio_emb_res = self.casual_audio_encoder(audio_input)
-        audio_emb_res = tuple(aa.to(self.dtype) for aa in audio_emb_res)
-        if self.enbale_adain:
-            audio_emb_global, audio_emb = audio_emb_res
-            self.audio_emb_global = audio_emb_global[:, motion_frames[1] :].clone()
-        else:
-            audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[:, motion_frames[1] :, :]
-
-        device = self.patch_embedding.weight.device
-
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        # cond states
-        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
-        x = [x_ + pose for x_, pose in zip(x, cond)]
-
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-
-        original_grid_sizes = deepcopy(grid_sizes)
-        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
-
-        num_frames = original_grid_sizes[0][0].item()
-        # Use original seq_len for frame_seqlen since seq_lens grows after adding motion/ref tokens
-        frame_seqlen = seq_lens[0] // num_frames
-
-        # ref and motion
+        self._encode_audio(audio_input, motion_frames)
+        x = self._embed_patches_with_pose(x, cond_states)
+        x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
         self.lat_motion_frames = motion_latents[0].shape[1]
-
         self.original_seq_len = seq_lens[0]
 
-        # compute the rope embeddings for the input
+        # RoPE (inline — per-batch and cond variants differ from other forwards)
         x = torch.cat(x)
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
 
@@ -1060,48 +1040,17 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 self.freqs,
                 start=None,
             )
-        mask_input = torch.zeros([1, x.shape[1]], dtype=torch.long, device=x.device)
-        x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
+        x = x + self.trainable_cond_mask(torch.zeros([1, x.shape[1]], dtype=torch.long, device=x.device)).to(x.dtype)
 
-        # time embeddings
-        if self.zero_timestep:
-            t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)])
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()
-            )  # t:[b+1,F], output:[(b+1)*F,dim]
-            e0 = (
-                self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-            )  # output:[b+1,F,6,dim]
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
-
-        if self.zero_timestep:
-            e = e[: -1 * t.shape[1]]
-            zero_e0 = e0[-1:]
-            e0 = e0[:-1]
-            e0 = torch.cat(
-                [
-                    e0.unsqueeze(3),
-                    zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1, 1, 1),
-                ],
-                dim=3,
-            )  # [B, F, 6, 2, dim]
-            e0 = [e0, self.original_seq_len]
-
-        # context
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
-        )
+        e, e0 = self._compute_timestep_embeddings(t)
+        context = self._embed_context(context)
 
         if self.use_context_parallel:
             global_rank = get_rank()
             model_sp_size = self.sp_size
             sp_rank = global_rank % model_sp_size
             x, orig_seq_len = pad_chunk(x, model_sp_size, dim=1)
-            sq_start_size = int(x.shape[1] * sp_rank)
-            seg_idx = e0[1] - sq_start_size
-            e0[1] = seg_idx
+            e0[1] = e0[1] - int(x.shape[1] * sp_rank)
             self.pre_compute_freqs, _ = pad_chunk(self.pre_compute_freqs, model_sp_size, dim=1)
 
         kwargs = dict(
@@ -1110,13 +1059,12 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.pre_compute_freqs,
             context=context,
-            context_lens=context_lens,
+            context_lens=None,
             block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
         )
-
         for idx, block in enumerate(self.blocks):
             kwargs.update(
                 {
@@ -1134,16 +1082,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 x = block(x, **kwargs)
                 x = self.after_transformer_block(idx, x, mask)
 
-        # Context Parallel
-        if self.use_context_parallel:
-            x = gather_forward(x.contiguous(), dim=1)
-
-        # unpatchify
-        x = x[:, : self.original_seq_len]
-        # head
-        x = self.head(x, e)
-        x = self.unpatchify(x, original_grid_sizes)
-        return [u for u in x]
+        return self._postprocess_output(x, e, original_grid_sizes)
 
     def _forward_train(
         self,
@@ -1160,87 +1099,21 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         drop_motion_frames=False,
         drop_part_motion_frames=False,
     ):
-        """
-        x:                  A list of videos each with shape [C, T, H, W].
-        t:                  [B,F].
-        context:            A list of text embeddings each with shape [L, C].
-        seq_len:            A list of video token lens, no need for this model.
-        ref_latents         A list of reference image for each video with shape [C, 1, H, W].
-        motion_latents      A list of  motion frames for each video with shape [C, T_m, H, W].
-        cond_states         A list of condition frames (i.e. pose) each with shape [C, T, H, W].
-        audio_input         The input audio embedding [B, num_wav2vec_layer, C_a, T_a].
-        motion_frames       The number of motion frames and motion latents frames encoded by vae, i.e. [17, 5]
-        add_last_motion     For the motioner, if add_last_motion > 0, it means that the most recent frame (i.e., the last frame) will be added.
-                            For frame packing, the behavior depends on the value of add_last_motion:
-                            add_last_motion = 0: Only the farthest part of the latent (i.e., clean_latents_4x) is included.
-                            add_last_motion = 1: Both clean_latents_2x and clean_latents_4x are included.
-                            add_last_motion = 2: All motion-related latents are used.
-        drop_motion_frames  Bool, whether drop the motion frames info
-        """
+        """Training forward pass (full sequence, blockwise causal mask, no KV cache)."""
         add_last_motion = self.add_last_motion * add_last_motion
-        audio_input = torch.cat(
-            [audio_input[..., 0:1].repeat(1, 1, 1, int(motion_frames[0])), audio_input],
-            dim=-1,
-        )
-        audio_emb_res = self.casual_audio_encoder(audio_input)
-        audio_emb_res = tuple(aa.to(self.dtype) for aa in audio_emb_res)
-        if self.enbale_adain:
-            audio_emb_global, audio_emb = audio_emb_res
-            self.audio_emb_global = audio_emb_global[:, motion_frames[1] :].clone()
-        else:
-            audio_emb = audio_emb_res
-        self.merged_audio_emb = audio_emb[:, motion_frames[1] :, :]
-
+        self._encode_audio(audio_input, motion_frames)
         device = self.patch_embedding.weight.device
-
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        # cond states
-        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
-        x = [x_ + pose for x_, pose in zip(x, cond)]
-
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-
-        original_grid_sizes = deepcopy(grid_sizes)
-        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
-
-        num_frames = original_grid_sizes[0][0].item()
-        # Use original seq_len for frame_seqlen since seq_lens grows after adding motion/ref tokens
-        frame_seqlen = seq_lens[0] // num_frames
-
-        # ref and motion
+        x = self._embed_patches_with_pose(x, cond_states)
+        x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
         self.lat_motion_frames = motion_latents[0].shape[1]
+        x, seq_lens, grid_sizes = self._prepare_ref_tokens(ref_latents, x, seq_lens, grid_sizes)
 
-        ref = [self.patch_embedding(r.unsqueeze(0)) for r in ref_latents]
-        batch_size = len(ref)
-        height, width = ref[0].shape[3], ref[0].shape[4]
-        ref_grid_sizes = [
-            [
-                torch.tensor([30, 0, 0]).unsqueeze(0).repeat(batch_size, 1),  # the start index
-                torch.tensor([31, height, width]).unsqueeze(0).repeat(batch_size, 1),  # the end index
-                torch.tensor([1, height, width]).unsqueeze(0).repeat(batch_size, 1),
-            ]  # the range
-        ]
-
-        ref = [r.flatten(2).transpose(1, 2) for r in ref]
-        self.original_seq_len = seq_lens[0]
-
-        seq_lens = seq_lens + torch.tensor([r.size(1) for r in ref], dtype=torch.long)
-
-        grid_sizes = grid_sizes + ref_grid_sizes
-
-        x = [torch.cat([u, r], dim=1) for u, r in zip(x, ref)]
-
-        # Initialize masks to indicate noisy latent, ref latent, and motion latent.
-        # However, at this point, only the first two (noisy and ref latents) are marked;
-        # the marking of motion latent will be implemented inside `inject_motion`.
+        # Mask: 0=noisy, 1=ref (motion=2 is set inside inject_motion)
         mask_input = [torch.zeros([1, u.shape[1]], dtype=torch.long, device=x[0].device) for u in x]
         for i in range(len(mask_input)):
-            mask_input[i][:, self.original_seq_len :] = 1  # 0=noisy, 1=ref
+            mask_input[i][:, self.original_seq_len :] = 1
 
-        # compute the rope embeddings for the input
+        # RoPE
         x = torch.cat(x)
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
         self.pre_compute_freqs = rope_precompute(x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None)
@@ -1267,7 +1140,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
 
-        # Construct blockwise causal attn mask
         if self.block_mask is None:
             self.block_mask = self._prepare_blockwise_causal_attn_mask(
                 device,
@@ -1277,36 +1149,8 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 motion_and_ref_seqlen=seq_lens[0] - self.original_seq_len,
             )
 
-        # time embeddings
-        if self.zero_timestep:
-            t = torch.cat([t, torch.zeros([1, t.shape[1]], dtype=t.dtype, device=t.device)])
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t.flatten()).float()
-            )  # t:[b+1,F], output:[(b+1)*F,dim]
-            e0 = (
-                self.time_projection(e).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
-            )  # output:[b+1,F,6,dim]
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
-
-        if self.zero_timestep:
-            e = e[: -1 * t.shape[1]]
-            zero_e0 = e0[-1:]
-            e0 = e0[:-1]
-            e0 = torch.cat(
-                [
-                    e0.unsqueeze(3),
-                    zero_e0.unsqueeze(3).repeat(e0.size(0), 1, 1, 1, 1),
-                ],
-                dim=3,
-            )  # [B, F, 6, 2, dim]
-            e0 = [e0, self.original_seq_len]
-
-        # context
-        context_lens = None
-        context = self.text_embedding(
-            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
-        )
+        e, e0 = self._compute_timestep_embeddings(t)
+        context = self._embed_context(context)
 
         if self.use_context_parallel:
             global_rank = get_rank()
@@ -1316,8 +1160,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             sq_size = [u.shape[1] for u in x]
             sq_start_size = sum(sq_size[:sp_rank])
             x = x[sp_rank]
-            seg_idx = e0[1] - sq_start_size
-            e0[1] = seg_idx
+            e0[1] = e0[1] - sq_start_size
             self.pre_compute_freqs = torch.chunk(self.pre_compute_freqs, model_sp_size, dim=1)[sp_rank]
 
         kwargs = dict(
@@ -1326,13 +1169,12 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.pre_compute_freqs,
             context=context,
-            context_lens=context_lens,
+            context_lens=None,
             block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
         )
-
         for idx, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(block, x, **kwargs, use_reentrant=False)
@@ -1341,15 +1183,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 x = block(x, **kwargs)
                 x = self.after_transformer_block(idx, x)
 
-        if self.use_context_parallel:
-            x = gather_forward(x.contiguous(), dim=1)
-
-        # unpatchify
-        x = x[:, : self.original_seq_len]
-        # head
-        x = self.head(x, e)
-        x = self.unpatchify(x, original_grid_sizes)
-        return [u for u in x]
+        return self._postprocess_output(x, e, original_grid_sizes)
 
     def forward(self, *args, **kwargs):
         sink_flag = kwargs.pop("sink_flag", False)
