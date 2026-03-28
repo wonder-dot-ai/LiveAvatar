@@ -7,13 +7,16 @@ name = "liveavatar-nari"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
+    "torch>=2.8.0,<2.9",
     "numpy",
     "Pillow",
     "torchvision",
     "tqdm",
     "safetensors",
     "diffusers>=0.37",
+    "transformers",
+    "huggingface_hub",
+    "imageio",
     "pyyaml",
     "librosa",
     "einops",
@@ -23,9 +26,18 @@ dependencies = [
 
 [project.optional-dependencies]
 lora = ["peft>=0.10"]
+flash = ["flash-attn-3"]
 
 [project.scripts]
 liveavatar-infer = "liveavatar_nari.cli.inference:main"
+
+[tool.uv]
+find-links = [
+    "https://windreamer.github.io/flash-attention3-wheels/cu128_torch280",
+]
+extra-index-url = [
+    "https://download.pytorch.org/whl/cu128",
+]
 
 [tool.setuptools.packages.find]
 include = ["liveavatar_nari*"]
