@@ -873,30 +873,32 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
     # --- Forward methods ---
 
-    def _forward_sink(
+    def prefill_cond_cache(
         self,
-        x,
-        t,
-        context,
-        seq_len,
+        *,
         ref_latents,
         motion_latents,
-        cond_states,
-        audio_input=None,
-        motion_frames=[17, 5],
-        add_last_motion=2,
+        context,
+        motion_frames,
+        kv_cache,
+        crossattn_cache,
+        latent_shape,
+        current_end,
+        latent_frames_per_block,
         drop_motion_frames=False,
-        kv_cache: dict = None,
-        crossattn_cache: dict = None,
-        current_start: int = 0,
-        current_end: int = 0,
-        sequence_current_start: int = 0,
+        add_last_motion=2,
     ):
+        """Prefill KV cache with conditioning tokens (ref image, motion, text, RoPE).
 
-        bs = x.__len__()
-        _, nf, height, width = x[0].shape
-        nf = 0
-        x = [torch.zeros([1, 5120, nf, height // 2, width // 2]).to(dtype=torch.bfloat16, device=x[0].device)] * bs
+        Called once at the start of autoregressive generation. Populates the
+        cond_k/cond_v slots in the KV cache and stores rope_cache for inference.
+        """
+        device = ref_latents.device
+        latent_h, latent_w = latent_shape
+        bs = ref_latents.shape[0]
+
+        # Create empty latent (no noisy content — this is prefill only)
+        x = [torch.zeros([1, self.dim, 0, latent_h, latent_w], dtype=torch.bfloat16, device=device)] * bs
 
         x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
         self.h_patches = original_grid_sizes[0][1].item()
@@ -904,17 +906,16 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         self.lat_motion_frames = motion_latents[0].shape[1]
         x, seq_lens, grid_sizes = self._prepare_ref_tokens(ref_latents, x, seq_lens, grid_sizes)
 
-        mask_input = [torch.ones([1, u.shape[1]], dtype=torch.long, device=x[0].device) for u in x]
+        mask_input = [torch.ones([1, u.shape[1]], dtype=torch.long, device=device) for u in x]
 
         # RoPE (stores to rope_cache for inference to use later)
         x = torch.cat(x)
-
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
         self.rope_cache["cond_shape"] = x.detach().view(b, s, n, d).shape
         self.rope_cache["grid_sizes"] = grid_sizes
         self.pre_compute_freqs = rope_precompute(
             x.detach().view(b, s, n, d),
-            rollout_grid_sizes(grid_sizes, current_start // frame_seqlen),
+            rollout_grid_sizes(grid_sizes, 0),
             self.freqs,
             start=None,
         )
@@ -930,8 +931,8 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             motion_latents,
             drop_motion_frames=drop_motion_frames,
             add_last_motion=add_last_motion,
-            rollout_num_frames=current_start // frame_seqlen,
-            sequence_current_start=sequence_current_start // frame_seqlen,
+            rollout_num_frames=0,
+            sequence_current_start=0,
         )
 
         x = torch.cat(x, dim=0)
@@ -940,6 +941,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
 
+        t = torch.zeros([1, latent_frames_per_block], dtype=torch.bfloat16, device=device)
         e, e0 = self._compute_timestep_embeddings(t)
         context = self._embed_context(context)
 
@@ -969,7 +971,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 {
                     "kv_cache": kv_cache[idx],
                     "crossattn_cache": crossattn_cache[idx],
-                    "current_start": current_start,
+                    "current_start": 0,
                     "current_end": current_end,
                 }
             )
@@ -977,8 +979,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 x = torch.utils.checkpoint.checkpoint(block, x, **kwargs, use_reentrant=False)
             else:
                 x = block(x, **kwargs)
-
-        return [n for n in torch.zeros_like(cond_states)]
 
     @conditional_compile
     def _forward_inference(
@@ -1212,10 +1212,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         return self._postprocess_output(x, e, original_grid_sizes)
 
     def forward(self, *args, **kwargs):
-        sink_flag = kwargs.pop("sink_flag", False)
         if kwargs.get("kv_cache") is not None:
-            if sink_flag:
-                return self._forward_sink(*args, **kwargs)
             return self._forward_inference(*args, **kwargs)
         return self._forward_train(*args, **kwargs)
 

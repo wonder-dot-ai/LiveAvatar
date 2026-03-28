@@ -16,7 +16,9 @@ from tqdm import tqdm
 
 class WanS2V:
     # VAE encoding constants
-    REF_WARMUP_FRAMES = 5  # repeat ref image N times for stable VAE encoding
+    REF_WARMUP_FRAMES = (
+        3  # repeat ref image N times for stable VAE encoding (verified identical to 5 across multiple images)
+    )
     REF_SKIP_LATENT_FRAMES = 1  # drop first N latent frames (VAE cold start)
     DECODE_SKIP_PIXEL_FRAMES = 3  # drop first N decoded frames (ref padding artifact)
 
@@ -292,11 +294,7 @@ class WanS2V:
         tokens_per_latent_frame,
         num_denoising_steps,
     ):
-        """Cache conditioning (ref, motion, text) into KV cache, broadcast to all slots.
-
-        The model's _forward_sink requires block_latents, cond, and audio in its
-        signature, but discards their values. We pass zeros for those.
-        """
+        """Cache conditioning (ref, motion, text) into KV cache, broadcast to all slots."""
         prefill_kv = [
             {
                 "k": layer["k"][0:1],
@@ -319,51 +317,19 @@ class WanS2V:
         if self.offload_kv_cache:
             self._move_kv_cache_to_device(self.device)
 
-        # Dummies — required by model signature but values are discarded
         latent_h, latent_w = motion_latents.shape[3], motion_latents.shape[4]
         fpb = latent_frames_per_block
-        dummy_block = torch.zeros(
-            self.latent_channels,
-            fpb,
-            latent_h,
-            latent_w,
-            dtype=self.param_dtype,
-            device=self.device,
-        )
-        dummy_cond = torch.zeros(
-            1,
-            self.latent_channels,
-            fpb,
-            latent_h,
-            latent_w,
-            dtype=self.param_dtype,
-            device=self.device,
-        )
-        dummy_audio = torch.zeros(
-            1,
-            self.audio_num_layers,
-            self.audio_feature_dim,
-            fpb * self.vae_temporal_stride,
-            dtype=self.param_dtype,
-            device=self.device,
-        )
 
-        self.noise_model(
-            [dummy_block],
-            t=torch.zeros([1, fpb], device=self.device, dtype=self.param_dtype),
-            context=text_prompt_embeddings[0:1],
-            seq_len=None,
+        self.noise_model.prefill_cond_cache(
             ref_latents=ref_image_latents,
             motion_latents=motion_latents,
-            cond_states=dummy_cond,
-            audio_input=dummy_audio,
+            context=text_prompt_embeddings[0:1],
             motion_frames=[self.motion_frames, latent_motion_frames],
-            drop_motion_frames=False,
-            sink_flag=True,
             kv_cache=prefill_kv,
             crossattn_cache=prefill_crossattn,
-            current_start=0,
+            latent_shape=(latent_h, latent_w),
             current_end=fpb * tokens_per_latent_frame,
+            latent_frames_per_block=fpb,
         )
 
         # Broadcast cond cache from slot 0 to all slots
