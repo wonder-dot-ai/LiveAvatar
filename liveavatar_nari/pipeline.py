@@ -447,7 +447,7 @@ class WanS2V:
                         motion_frames=[self.motion_frames, latent_motion_frames],
                         kv_cache=step_kv,
                         crossattn_cache=step_crossattn,
-                        current_start=token_start,
+                        current_start=torch.tensor([token_start], device=self.device),
                         current_end=token_start + tokens_per_block,
                     )
 

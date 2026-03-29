@@ -119,18 +119,19 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
             seg_len_block = seg_idx[1] - seg_idx[0]
 
             if isinstance(current_start, torch.Tensor):
-                # Per-batch path (batched pipeline)
+                # Per-batch path
                 active_cond_cache_size = int(kv_cache["cond_end"])
                 kv_max = kv_cache["k"].shape[1]
 
                 active_sizes = []
                 for bi in range(b):
-                    cs = int(current_start[bi].item())
-                    if cs >= kv_max:
-                        cs = cs % kv_max
+                    cs_raw = int(current_start[bi].item())
+                    wrapped = cs_raw >= kv_max
+                    cs = cs_raw % kv_max if wrapped else cs_raw
                     kv_cache["k"][bi, cs : (cs + seg_len_block)] = roped_key[bi, seg_idx[0] : seg_idx[1]]
                     kv_cache["v"][bi, cs : (cs + seg_len_block)] = v[bi, seg_idx[0] : seg_idx[1]]
-                    active_sizes.append(min(cs + seg_len_block, kv_max))
+                    # After wrap, full cache is valid; before wrap, only up to write position
+                    active_sizes.append(kv_max if wrapped else cs + seg_len_block)
 
                 max_active_size = max(active_sizes)
 
@@ -922,7 +923,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         x = torch.cat(x)
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
 
-        if isinstance(current_start, torch.Tensor) and b > 1:
+        if isinstance(current_start, torch.Tensor):
             # Per-batch RoPE for batched pipeline
             frame_seqlen_int = int(frame_seqlen)
             freqs_list = []
