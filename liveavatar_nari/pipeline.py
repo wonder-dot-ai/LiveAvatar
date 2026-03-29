@@ -42,7 +42,7 @@ class WanS2V:
         from .models.causal_model_s2v import CausalWanModel_S2V
         from .modules.s2v.audio_encoder import AudioEncoder
         from .modules.t5 import T5EncoderModel
-        from .modules.vae2_1 import Wan2_1_VAE
+        from .modules.vae_streaming import WanVAE as Wan2_1_VAE
 
         t0 = time.perf_counter()
 
@@ -561,9 +561,10 @@ class WanS2V:
                 if block_index == 0:
                     ref_image_latents = block_latents.unsqueeze(0)[:, :, 0:1]
 
-        # ---- 3. Deferred VAE decode (clip-sized chunks with motion re-encoding) ----
+        # ---- 3. Deferred streaming VAE decode (per-block, no motion re-encoding) ----
         print(f"DiT generation complete ({total_blocks} blocks). Starting VAE decode...")
-        decoded_clips = []
+        pixel_frames_per_block = latent_frames_per_block * self.vae_temporal_stride
+        decoded_blocks = []
         if all_block_latents:
             if offload_model:
                 self.kv_cache = None
@@ -572,38 +573,20 @@ class WanS2V:
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-            motion_latents_decode = motion_latents
-            for chunk_start in range(0, total_blocks, blocks_per_decode_chunk):
-                chunk_end = min(chunk_start + blocks_per_decode_chunk, total_blocks)
-                chunk_latent = (
-                    torch.cat(all_block_latents[chunk_start:chunk_end], dim=1)
-                    .unsqueeze(0)
-                    .to(device=self.vae.device, dtype=self.vae.dtype)
-                )
+            # Warmup: feed motion latents to populate causal conv caches
+            self.vae.model.clear_cache_decode()
+            warmup_latents = motion_latents[:, :, :7].to(device=self.vae.device, dtype=self.vae.dtype)
+            self.vae.stream_decode(warmup_latents)
 
-                decode_input = torch.cat([motion_latents_decode, chunk_latent], dim=2)
-                image = torch.stack(self.vae.decode(decode_input))
-
-                # Trim: keep only generated frames (not motion prefix)
-                n_generated = (chunk_end - chunk_start) * latent_frames_per_block * self.vae_temporal_stride
-                image = image[:, :, -n_generated:]
-                if chunk_start == 0:
+            for block_idx, block_lat_cpu in enumerate(all_block_latents):
+                block_lat = block_lat_cpu.unsqueeze(0).to(device=self.vae.device, dtype=self.vae.dtype)
+                image = torch.stack(self.vae.stream_decode(block_lat))
+                image = image[:, :, -pixel_frames_per_block:]
+                if block_idx == 0:
                     image = image[:, :, self.DECODE_SKIP_PIXEL_FRAMES :]
+                decoded_blocks.append(image.cpu())
 
-                # Update motion context for next chunk's VAE decode
-                overlap = min(self.motion_frames, image.shape[2])
-                motion_pixel_frames = torch.cat(
-                    [motion_pixel_frames[:, :, overlap:], image[:, :, -overlap:]],
-                    dim=2,
-                )
-                motion_pixel_frames = motion_pixel_frames.to(
-                    dtype=motion_latents_decode.dtype,
-                    device=motion_latents_decode.device,
-                )
-                motion_latents_decode = torch.stack(self.vae.encode(motion_pixel_frames)).type_as(chunk_latent)
-                decoded_clips.append(image.cpu())
-
-        video = torch.cat(decoded_clips, dim=2)
+        video = torch.cat(decoded_blocks, dim=2)
         self._sampler_timesteps = None
         self._sampler_sigmas = None
         self.kv_cache = None
