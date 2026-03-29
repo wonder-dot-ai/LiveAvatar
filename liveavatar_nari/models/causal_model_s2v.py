@@ -786,6 +786,19 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         Called once at the start of autoregressive generation. Populates the
         cond_k/cond_v slots in the KV cache and stores rope_cache for inference.
+
+        Args:
+            ref_latents: Sink frame latent [B, C, 1, H, W].
+            motion_latents: Static VAE-encoded reference frames [B, C, T_m, H, W] for FramePack.
+            context: T5 text embeddings, list of [L, 4096] tensors.
+            motion_frames: [pixel_motion_frames, latent_motion_frames] sizes for FramePack.
+            kv_cache: Per-layer KV cache dicts (slot 0 only, broadcast to all slots after).
+            crossattn_cache: Per-layer cross-attention cache dicts.
+            latent_shape: (latent_h, latent_w) spatial dims in latent space.
+            current_end: Token count for one block (latent_frames_per_block * tokens_per_frame).
+            latent_frames_per_block: Number of latent frames per block (used for timestep shape).
+            drop_motion_frames: Zero out motion tokens (ablation only, always False).
+            add_last_motion: FramePack bucket control (0/1/2). 2 = use all buckets.
         """
         device = ref_latents.device
         latent_h, latent_w = latent_shape
@@ -871,32 +884,38 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             x = block(x, **kwargs)
 
     @conditional_compile
-    def _forward_inference(
+    def forward(
         self,
         x,
         t,
         context,
-        seq_len,
-        ref_latents,
-        motion_latents,
         cond_states,
-        audio_input=None,
-        motion_frames=[17, 5],
-        add_last_motion=2,
-        drop_motion_frames=False,
-        kv_cache: dict = None,
-        crossattn_cache: dict = None,
-        current_start: int = 0,
-        current_end: int = 0,
-        sequence_current_start: int = 0,
+        audio_input,
+        motion_frames,
+        kv_cache,
+        crossattn_cache,
+        current_start,
+        current_end,
         mask=None,
     ):
-        """Streaming inference forward pass (cached KV, no ref tokens)."""
-        add_last_motion = int(self.add_last_motion) * add_last_motion
+        """Streaming inference forward pass (blockwise autoregressive with cached KV).
+
+        Args:
+            x: Noisy latent block, list of [C, F, H, W] tensors (F=latent_frames_per_block).
+            t: Denoising timestep [B, F], same value broadcast to all frames.
+            context: T5 text embeddings, list of [L, 4096] tensors.
+            cond_states: Pose conditioning [B, C, F, H, W] (zeros when no pose control).
+            audio_input: Wav2Vec2 features [B, 25, 1024, T_a] for this block's audio segment.
+            motion_frames: [pixel_motion_frames, latent_motion_frames] sizes for FramePack.
+            kv_cache: Per-layer rolling KV cache dicts {k, v, cond_k, cond_v, cond_end}.
+            crossattn_cache: Per-layer cross-attention cache dicts {k, v, is_init}.
+            current_start: Token offset for this block in KV cache (wraps via modulo).
+            current_end: Token offset where this block ends (current_start + tokens_per_block).
+            mask: Per-actor spatial mask for multi-actor audio injection, or None.
+        """
         self._encode_audio(audio_input, motion_frames)
         x = self._embed_patches_with_pose(x, cond_states)
         x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
-        self.lat_motion_frames = motion_latents[0].shape[1]
         self.original_seq_len = seq_lens[0]
 
         # RoPE (inline — per-batch and cond variants differ from other forwards)
@@ -994,9 +1013,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             x = self.after_transformer_block(idx, x, mask)
 
         return self._postprocess_output(x, e, original_grid_sizes)
-
-    def forward(self, *args, **kwargs):
-        return self._forward_inference(*args, **kwargs)
 
     # --- Output ---
 
