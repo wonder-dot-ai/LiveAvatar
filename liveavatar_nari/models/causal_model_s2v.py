@@ -82,97 +82,94 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         super().__init__(dim, num_heads, window_size, qk_norm, eps)
         self.local_attn_size = local_attn_size
 
-    def forward(
-        self,
-        x,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        kv_cache,
-        current_start=0,
-        current_end=0,
-        sp_size=None,
-        seg_idx=None,
-        freqs_cond=None,
-    ):
-        """
+    def _qkv(self, x):
+        b, s = x.shape[:2]
+        n, d = self.num_heads, self.head_dim
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
+        return q, k, v
+
+    def _output(self, x):
+        return self.o(x.flatten(2))
+
+    def forward(self, x, grid_sizes, freqs, kv_cache, current_start, freqs_cond):
+        """Streaming inference: write to rolling KV cache and attend to cached history + cond.
+
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            x: [B, L, dim] normalized hidden states.
+            grid_sizes: Post-patch grid sizes for RoPE.
+            freqs: Precomputed RoPE frequencies for noisy tokens.
+            kv_cache: Rolling KV cache dict {k, v, cond_k, cond_v, cond_end}.
+            current_start: Token offset (scalar int or [B] tensor), wraps via modulo.
+            freqs_cond: Rolling RoPE frequencies for sink conditioning cache.
         """
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+        b = x.shape[0]
+        q, k, v = self._qkv(x)
 
-        # query, key, value function
-        def qkv_fn(x):
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
-            v = self.v(x).view(b, s, n, d)
-            return q, k, v
+        roped_query = causal_rope_apply(q, grid_sizes, freqs).type_as(v)
+        roped_key = causal_rope_apply(k, grid_sizes, freqs).type_as(v)
+        seq_len = x.shape[1]
 
-        q, k, v = qkv_fn(x)
+        active_cond_cache_size = int(kv_cache["cond_end"])
+        kv_max = kv_cache["k"].shape[1]
 
-        if seg_idx[1] - seg_idx[0] > 0:  # streaming inference
-            roped_query = causal_rope_apply(q, grid_sizes, freqs).type_as(v)
-            roped_key = causal_rope_apply(k, grid_sizes, freqs).type_as(v)
-            seg_len_block = seg_idx[1] - seg_idx[0]
+        active_sizes = []
+        for bi in range(b):
+            cs_raw = int(current_start[bi].item()) if isinstance(current_start, torch.Tensor) else current_start
+            wrapped = cs_raw >= kv_max
+            cs = cs_raw % kv_max if wrapped else cs_raw
+            kv_cache["k"][bi, cs : cs + seq_len] = roped_key[bi]
+            kv_cache["v"][bi, cs : cs + seq_len] = v[bi]
+            active_sizes.append(kv_max if wrapped else cs + seq_len)
 
-            # current_start: [B] tensor or scalar int
-            active_cond_cache_size = int(kv_cache["cond_end"])
-            kv_max = kv_cache["k"].shape[1]
+        max_active_size = max(active_sizes)
 
-            # Write new KV entries and compute active sizes per batch item
-            active_sizes = []
-            for bi in range(b):
-                cs_raw = int(current_start[bi].item()) if isinstance(current_start, torch.Tensor) else current_start
-                wrapped = cs_raw >= kv_max
-                cs = cs_raw % kv_max if wrapped else cs_raw
-                kv_cache["k"][bi, cs : cs + seg_len_block] = roped_key[bi, seg_idx[0] : seg_idx[1]]
-                kv_cache["v"][bi, cs : cs + seg_len_block] = v[bi, seg_idx[0] : seg_idx[1]]
-                active_sizes.append(kv_max if wrapped else cs + seg_len_block)
+        cond_k_roped = causal_rope_apply_cond(kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond).type_as(
+            v
+        )
 
-            max_active_size = max(active_sizes)
+        x = attention(
+            q=roped_query,
+            k=torch.cat([kv_cache["k"][:, :max_active_size], cond_k_roped], dim=1),
+            v=torch.cat(
+                [kv_cache["v"][:, :max_active_size], kv_cache["cond_v"][:, :active_cond_cache_size]],
+                dim=1,
+            ),
+            k_lens=torch.tensor(
+                [active_sizes[bi] + active_cond_cache_size for bi in range(b)],
+                dtype=torch.int32,
+                device=x.device,
+            ),
+            window_size=self.window_size,
+        )
+        return self._output(x)
 
-            cond_k_roped = causal_rope_apply_cond(
-                kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond
-            ).type_as(v)
+    def prefill_cond(self, x, grid_sizes, freqs, kv_cache):
+        """Prefill cond cache: store ref/motion tokens into cond_k/cond_v.
 
-            x = attention(
-                q=roped_query[:, seg_idx[0] : seg_idx[1]],
-                k=torch.cat([kv_cache["k"][:, :max_active_size], cond_k_roped], dim=1),
-                v=torch.cat(
-                    [kv_cache["v"][:, :max_active_size], kv_cache["cond_v"][:, :active_cond_cache_size]],
-                    dim=1,
-                ),
-                k_lens=torch.tensor(
-                    [active_sizes[bi] + active_cond_cache_size for bi in range(b)],
-                    dtype=torch.int32,
-                    device=x.device,
-                ),
-                window_size=self.window_size,
-            )
+        Args:
+            x: [B, L, dim] normalized hidden states (ref + motion tokens).
+            grid_sizes: Post-patch grid sizes for RoPE.
+            freqs: Precomputed RoPE frequencies for cond tokens.
+            kv_cache: KV cache dict — writes to cond_k, cond_v, cond_end.
+        """
+        b = x.shape[0]
+        q, k, v = self._qkv(x)
+        seq_len = x.shape[1]
 
-        elif seg_idx[2] - seg_idx[1] > 0:  # prefill cond caching
-            roped_query = causal_rope_apply_cond(q, grid_sizes, freqs).type_as(v)
-            kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), seg_idx[2] - seg_idx[1])
-            kv_cache["cond_k"][:, : int(kv_cache["cond_end"])] = k[:, seg_idx[1] : seg_idx[2]]
-            kv_cache["cond_v"][:, : int(kv_cache["cond_end"])] = v[:, seg_idx[1] : seg_idx[2]]
-            x = attention(
-                q=roped_query[:, seg_idx[1] : seg_idx[2]],
-                k=causal_rope_apply_cond(k, grid_sizes, freqs).type_as(v)[:, : int(kv_cache["cond_end"])],
-                v=kv_cache["cond_v"][:, : int(kv_cache["cond_end"])],
-                k_lens=torch.tensor(int(kv_cache["cond_end"])).repeat(b),
-                window_size=self.window_size,
-            )
-
-        else:
-            raise ValueError("segment index is invalid: no noisy or conditioning tokens")
-
-        # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        roped_query = causal_rope_apply_cond(q, grid_sizes, freqs).type_as(v)
+        kv_cache["cond_end"][0] = max(int(kv_cache["cond_end"]), seq_len)
+        kv_cache["cond_k"][:, :seq_len] = k
+        kv_cache["cond_v"][:, :seq_len] = v
+        x = attention(
+            q=roped_query,
+            k=causal_rope_apply_cond(k, grid_sizes, freqs).type_as(v)[:, :seq_len],
+            v=kv_cache["cond_v"][:, :seq_len],
+            k_lens=torch.tensor(seq_len).repeat(b),
+            window_size=self.window_size,
+        )
+        return self._output(x)
 
 
 class CausalWanS2VAttentionBlock(WanAttentionBlock):
@@ -191,6 +188,44 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         super().__init__(dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
         self.self_attn = CausalWanS2VSelfAttention(dim, num_heads, window_size, qk_norm, eps, local_attn_size)
 
+    def _expand_modulation(self, x, e, seq_lens, frame_seqlen, is_prefill, use_context_parallel=False, sp_size=None):
+        """Expand timestep modulation [B,F,6,2,dim] → tuple of 6 [B,L,dim] tensors."""
+        assert e[0].dtype == torch.float32
+        original_seq_len = e[1].item()
+        e = e[0]  # [B, F, 6, 2, C]
+
+        modulation = self.modulation.unsqueeze(1).unsqueeze(3)
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            e = (modulation + e).chunk(6, dim=2)
+        e = [el.squeeze(2) for el in e]  # tuple(6)*[B,F,2,dim]
+
+        e_cache = []
+        for element in e:
+            if is_prefill:
+                element_noisy = element[:, :0, 0]  # empty — no noisy tokens in prefill
+            else:
+                element_noisy = element[:, :, 0].repeat_interleave(int(frame_seqlen), dim=1)
+            element_cond = element[:, 0:1, 1].repeat(1, seq_lens - element_noisy.shape[1], 1)
+            element = torch.cat([element_noisy, element_cond], dim=1)
+            if use_context_parallel:
+                global_rank = get_rank()
+                model_sp_size = sp_size if sp_size is not None else self.sp_size
+                sp_rank = global_rank % model_sp_size
+                element, _ = pad_chunk(element, model_sp_size, dim=1)
+            e_cache.append(element)
+        return tuple(e_cache), original_seq_len
+
+    def _cross_attn_ffn(self, x, context, e, dtype):
+        """Cross-attention to text context + feed-forward."""
+        x = x + self.cross_attn(self.norm3(x.to(torch.bfloat16)).to(dtype), context, None)
+        norm2_x = self.norm2(x).float()
+        norm2_x = norm2_x * (1 + e[4]) + e[3]
+        y = self.ffn(norm2_x.to(dtype))
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            y = y * e[5]
+            x = x + y
+        return x.to(dtype)
+
     def forward(
         self,
         x,
@@ -199,92 +234,53 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         grid_sizes,
         freqs,
         context,
-        context_lens,
         frame_seqlen,
         kv_cache,
-        crossattn_cache=None,
-        current_start=0,
-        current_end=0,
+        current_start,
+        freqs_cond,
         use_context_parallel=False,
         sp_size=None,
-        in_sink_forward=False,
-        freqs_cond=None,
     ):
-        r"""
-        Args:
-            e(?): e[0]: Shape [B, F, 6, 2, C], e[1]: seg_idx. e[0] is synced across USP, e[1] is not.
-        """
-        bf_dtype_tensor = torch.zeros([1]).type_as(x)
-        assert e[0].dtype == torch.float32
-        seg_idx = e[1].item()
-        seg_idx = min(max(0, seg_idx), x.size(1))
-        seg_idx = [0, seg_idx, x.size(1)]
-        e = e[0]  # [B, F, 6, 2, C]
-
-        modulation = self.modulation.unsqueeze(1).unsqueeze(3)  # [1, 6, 5120]->[1, 1, 6, 1, 5120]
-        with torch.amp.autocast("cuda", dtype=torch.float32):
-            e = (modulation + e).chunk(6, dim=2)  # [B,F,6,2,dim]->tuple(6)*[B,F,1,2,dim]
-        assert e[0].dtype == torch.float32
-
-        e = [element.squeeze(2) for element in e]  # tuple(6)*[B,F,2,dim]
-
-        # e:  tuple(6)*[B,F,2,dim] -> tuple(6)*[B,L,dim]
-        e_cache = []
-
-        for element in e:  # element: [B,F,2,dim]
-            if in_sink_forward:
-                element_noisy = element[:, :0, 0]
-            else:
-                element_noisy = element[:, :, 0].repeat_interleave(int(frame_seqlen), dim=1)
-            element_cond = element[:, 0:1, 1].repeat(1, seq_lens - element_noisy.shape[1], 1)
-            element = torch.cat([element_noisy, element_cond], dim=1)
-            if use_context_parallel:
-                global_rank = get_rank()
-                model_sp_size = sp_size if sp_size is not None else self.sp_size
-                sp_rank = global_rank % model_sp_size  # rank within sequence parallel group
-                element, _ = pad_chunk(element, model_sp_size, dim=1)
-            e_cache.append(element)
-        e = tuple(e_cache)
-
+        """Streaming inference block: self-attn with KV cache → cross-attn → FFN."""
+        dtype = x.dtype  # capture entry dtype (bfloat16) before fp32 operations
+        e, _ = self._expand_modulation(
+            x, e, seq_lens, frame_seqlen, is_prefill=False, use_context_parallel=use_context_parallel, sp_size=sp_size
+        )
         norm_x = self.norm1(x).float()
         norm_x = norm_x * (1 + e[1]) + e[0]
 
-        y = self.self_attn(
-            norm_x.type_as(bf_dtype_tensor),
-            seq_lens,
-            grid_sizes,
-            freqs,
-            kv_cache,
-            current_start,
-            current_end,
-            sp_size,
-            seg_idx,
-            freqs_cond,
-        )  # [b,l,dim]
+        y = self.self_attn(norm_x.to(dtype), grid_sizes, freqs, kv_cache, current_start, freqs_cond)
 
         with torch.amp.autocast("cuda", dtype=torch.float32):
-            y = y * e[2]
-            x = x + y
+            x = x + y * e[2]
+        return self._cross_attn_ffn(x, context, e, dtype)
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(
-                self.norm3(x.to(torch.bfloat16)).type_as(bf_dtype_tensor),
-                context,
-                context_lens,
-            )
-            norm2_x = self.norm2(x).float()
-            norm2_x = norm2_x * (1 + e[4]) + e[3]
+    def prefill_cond(
+        self,
+        x,
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        frame_seqlen,
+        kv_cache,
+        use_context_parallel=False,
+        sp_size=None,
+    ):
+        """Prefill block: populate cond KV cache with ref/motion tokens."""
+        dtype = x.dtype
+        e, _ = self._expand_modulation(
+            x, e, seq_lens, frame_seqlen, is_prefill=True, use_context_parallel=use_context_parallel, sp_size=sp_size
+        )
+        norm_x = self.norm1(x).float()
+        norm_x = norm_x * (1 + e[1]) + e[0]
 
-            y = self.ffn(norm2_x.type_as(bf_dtype_tensor))
+        y = self.self_attn.prefill_cond(norm_x.to(dtype), grid_sizes, freqs, kv_cache)
 
-            with torch.amp.autocast("cuda", dtype=torch.float32):
-                y = y * e[5]
-                x = x + y
-            return x
-
-        x = cross_attn_ffn(x, context, context_lens, e).type_as(bf_dtype_tensor)
-        return x
+        with torch.amp.autocast("cuda", dtype=torch.float32):
+            x = x + y * e[2]
+        return self._cross_attn_ffn(x, context, e, dtype)
 
 
 class CausalWanModel_S2V(ModelMixin, ConfigMixin):
@@ -806,28 +802,19 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             e0[1] = e0[1] - int(x.shape[1] * sp_rank)
             self.pre_compute_freqs, _ = pad_chunk(self.pre_compute_freqs, model_sp_size, dim=1)
 
-        kwargs = dict(
-            e=e0,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
-            context=context,
-            context_lens=None,
-            frame_seqlen=frame_seqlen,
-            use_context_parallel=self.use_context_parallel,
-            sp_size=self.sp_size,
-            in_sink_forward=True,
-        )
         for idx, block in enumerate(self.blocks):
-            kwargs.update(
-                {
-                    "kv_cache": kv_cache[idx],
-                    "crossattn_cache": crossattn_cache[idx],
-                    "current_start": 0,
-                    "current_end": current_end,
-                }
+            x = block.prefill_cond(
+                x,
+                e=e0,
+                seq_lens=seq_lens,
+                grid_sizes=grid_sizes,
+                freqs=self.pre_compute_freqs,
+                context=context,
+                frame_seqlen=frame_seqlen,
+                kv_cache=kv_cache[idx],
+                use_context_parallel=self.use_context_parallel,
+                sp_size=self.sp_size,
             )
-            x = block(x, **kwargs)
 
     @conditional_compile
     def forward(
@@ -914,28 +901,21 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             e0[1] = e0[1] - int(x.shape[1] * sp_rank)
             self.pre_compute_freqs, _ = pad_chunk(self.pre_compute_freqs, model_sp_size, dim=1)
 
-        kwargs = dict(
-            e=e0,
-            seq_lens=seq_lens[0],
-            grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
-            context=context,
-            context_lens=None,
-            frame_seqlen=frame_seqlen,
-            use_context_parallel=self.use_context_parallel,
-            sp_size=self.sp_size,
-        )
         for idx, block in enumerate(self.blocks):
-            kwargs.update(
-                {
-                    "kv_cache": kv_cache[idx],
-                    "crossattn_cache": crossattn_cache[idx],
-                    "current_start": current_start,
-                    "current_end": current_end,
-                    "freqs_cond": cond_pre_compute_freqs,
-                }
+            x = block(
+                x,
+                e=e0,
+                seq_lens=seq_lens[0],
+                grid_sizes=grid_sizes,
+                freqs=self.pre_compute_freqs,
+                context=context,
+                frame_seqlen=frame_seqlen,
+                kv_cache=kv_cache[idx],
+                current_start=current_start,
+                freqs_cond=cond_pre_compute_freqs,
+                use_context_parallel=self.use_context_parallel,
+                sp_size=self.sp_size,
             )
-            x = block(x, **kwargs)
             x = self.after_transformer_block(idx, x, mask)
 
         return self._postprocess_output(x, e, original_grid_sizes)
