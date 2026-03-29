@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=0 liveavatar-infer \
     --fp8 \
     --offload_model True \
     --infer_frames 48 \
-    --num_clip 100 \
+    --num_blocks 100 \
     --sample_steps 4 \
     --seed 4200 \
     --output "output/result_nari_${TIMESTAMP}.mp4"

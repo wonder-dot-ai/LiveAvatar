@@ -18,8 +18,8 @@ def parse_args():
     p.add_argument("--lora_config", default="configs/s2v_inference.yaml", help="LoRA config YAML")
     p.add_argument("--save_merged", default=None, help="Save merged DiT to this dir")
     # Generation
-    p.add_argument("--infer_frames", type=int, default=48, help="Frames per clip")
-    p.add_argument("--num_clip", type=int, default=1, help="Number of clips")
+    p.add_argument("--infer_frames", type=int, default=48, help="Pixel frames per VAE decode chunk")
+    p.add_argument("--num_blocks", type=int, default=None, help="Max blocks to generate (None=full audio)")
     p.add_argument("--max_area", type=int, default=720 * 400, help="Max pixel area")
     p.add_argument("--sample_steps", type=int, default=4, help="Diffusion sampling steps")
     p.add_argument("--seed", type=int, default=-1, help="Random seed (-1=random)")
@@ -108,7 +108,7 @@ def main():
     # Generate
     print(f"Generating: image={args.image}, audio={args.audio}")
     print(
-        f"  infer_frames={args.infer_frames}, num_clip={args.num_clip}, "
+        f"  infer_frames={args.infer_frames}, num_blocks={args.num_blocks}, "
         f"sample_steps={args.sample_steps}, seed={args.seed}"
     )
 
@@ -117,7 +117,7 @@ def main():
         ref_image_path=args.image,
         audio_path=args.audio,
         infer_frames=args.infer_frames,
-        num_clips=args.num_clip,
+        max_blocks=args.num_blocks,
         max_area=args.max_area,
         sampling_steps=args.sample_steps,
         seed=args.seed,

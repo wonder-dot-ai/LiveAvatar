@@ -394,13 +394,12 @@ class WanS2V:
         input_prompt=None,
         ref_image_path=None,
         audio_path=None,
-        num_clips=1,
+        max_blocks=None,
         max_area=720 * 1280,
         infer_frames=80,
         sampling_steps=4,
         seed=-1,
         offload_model=True,
-        max_clips=1000000,
     ):
         num_denoising_steps = sampling_steps
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
@@ -410,34 +409,39 @@ class WanS2V:
             ref_image_path, max_area
         )
         text_prompt_embeddings = self._prepare_text(input_prompt, offload_model)
-        audio_embeddings, num_clips = self._prepare_audio(audio_path, infer_frames, num_clips)
+        audio_embeddings, _ = self._prepare_audio(audio_path, infer_frames, None)
 
         # Latent space dimensions
         latent_motion_frames = math.ceil(self.motion_frames / self.vae_temporal_stride)
         latent_h = HEIGHT // self.vae_spatial_stride
         latent_w = WIDTH // self.vae_spatial_stride
-        latent_target_frames = (
-            math.ceil((infer_frames + self.motion_frames) / self.vae_temporal_stride) - latent_motion_frames
-        )
-        latent_shape = [latent_target_frames, latent_h, latent_w]
-
-        # Block/token dimensions
         latent_frames_per_block = self.latent_frames_per_block
-        num_blocks = latent_target_frames // latent_frames_per_block
         tokens_per_latent_frame = latent_h * latent_w // self.patch_spatial_stride
         tokens_per_block = latent_frames_per_block * tokens_per_latent_frame
-        max_tokens = np.prod(latent_shape) // self.patch_spatial_stride
         audio_frames_per_block = latent_frames_per_block * self.vae_temporal_stride
+
+        # Total blocks from audio length
+        total_audio_pixel_frames = audio_embeddings.shape[-1]
+        total_blocks = total_audio_pixel_frames // audio_frames_per_block
+        if max_blocks is not None:
+            total_blocks = min(total_blocks, max_blocks)
+
+        # Decode chunk size (in blocks) — derived from infer_frames for OOM safety
+        latent_target_frames_per_chunk = (
+            math.ceil((infer_frames + self.motion_frames) / self.vae_temporal_stride) - latent_motion_frames
+        )
+        blocks_per_decode_chunk = latent_target_frames_per_chunk // latent_frames_per_block
+
+        # KV cache is a rolling window — size per decode chunk, wraps via modulo
+        max_tokens = blocks_per_decode_chunk * tokens_per_block
 
         from diffusers import FlowMatchEulerDiscreteScheduler
 
         sample_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=self.num_train_timesteps, shift=3)
 
-        # ---- 2. Generate clips ----
+        # ---- 2. Blockwise DiT generation ----
         with torch.amp.autocast("cuda", dtype=self.param_dtype), torch.no_grad():
-            decoded_clips = []
-            clip_latent_outputs = []
-            total_clips = min(max_clips, num_clips)
+            all_block_latents = []
 
             dummy_cond = torch.zeros(
                 1,
@@ -459,7 +463,6 @@ class WanS2V:
             self._initialize_kv_cache(num_denoising_steps, self.param_dtype, self.device, max_tokens)
             self._initialize_crossattn_cache(num_denoising_steps, self.param_dtype, self.device)
 
-            # ---- Prefill cond cache ----
             self._prefill_cond_cache(
                 text_prompt_embeddings=text_prompt_embeddings,
                 motion_latents=motion_latents,
@@ -470,146 +473,137 @@ class WanS2V:
                 num_denoising_steps=num_denoising_steps,
             )
 
-            # ---- Setup scheduler ----
             sample_scheduler.set_timesteps(sampling_steps, device=self.device)
             self._sampler_timesteps = sample_scheduler.timesteps
             self._sampler_sigmas = sample_scheduler.sigmas
             timesteps = self._sampler_timesteps
 
-            for clip_index in range(total_clips):
-                # ---- Clip-level setup ----
-                seed_g = torch.Generator(device=self.device)
-                seed_g.manual_seed(seed + clip_index)
-                clip_noise = torch.randn(
+            seed_g = torch.Generator(device=self.device)
+            seed_g.manual_seed(seed)
+
+            for block_index in tqdm(range(total_blocks), desc="blocks"):
+                block_latents = torch.randn(
                     self.latent_channels,
-                    *latent_shape,
+                    latent_frames_per_block,
+                    latent_h,
+                    latent_w,
                     dtype=self.param_dtype,
                     device=self.device,
                     generator=seed_g,
                 )
-                clip_audio = audio_embeddings[..., clip_index * infer_frames : (clip_index + 1) * infer_frames]
-                input_motion_latents = motion_latents.clone()
-                clip_output = torch.zeros_like(clip_noise)
 
-                if offload_model:
-                    self.noise_model.to(self.device)
-                    self.vae.model.cpu()
-                    torch.cuda.empty_cache()
+                audio_start = block_index * audio_frames_per_block
+                audio_end = audio_start + audio_frames_per_block
+                block_audio = audio_embeddings[..., audio_start:audio_end]
 
-                # ---- Denoising ----
-                clip_token_offset = clip_index * num_blocks * tokens_per_block
+                token_start = block_index * tokens_per_block
+                token_end = token_start + tokens_per_block
 
-                for block_index in tqdm(range(num_blocks), desc=f"clip {clip_index}"):
-                    block_start = block_index * latent_frames_per_block
-                    block_end = block_start + latent_frames_per_block
-                    block_latents = clip_noise[:, block_start:block_end]
+                sample_scheduler.timesteps = self._sampler_timesteps
+                sample_scheduler.sigmas = self._sampler_sigmas
+                sample_scheduler._step_index = 0
+                sample_scheduler._begin_index = 0
 
-                    audio_start = block_index * audio_frames_per_block
-                    audio_end = audio_start + audio_frames_per_block
+                for step_index, t in enumerate(timesteps):
+                    if self.offload_kv_cache:
+                        self._move_kv_cache_to_device(self.device)
 
-                    token_start = block_index * tokens_per_block + clip_token_offset
-                    token_end = token_start + tokens_per_block
+                    step_kv = [
+                        {
+                            "k": layer["k"][step_index : step_index + 1],
+                            "v": layer["v"][step_index : step_index + 1],
+                            "cond_k": layer["cond_k"][step_index : step_index + 1],
+                            "cond_v": layer["cond_v"][step_index : step_index + 1],
+                            "cond_end": layer["cond_end"],
+                        }
+                        for layer in self.kv_cache
+                    ]
+                    step_crossattn = [
+                        {
+                            "k": layer["k"][step_index : step_index + 1],
+                            "v": layer["v"][step_index : step_index + 1],
+                            "is_init": layer["is_init"],
+                        }
+                        for layer in self.crossattn_cache
+                    ]
 
-                    sample_scheduler.timesteps = self._sampler_timesteps
-                    sample_scheduler.sigmas = self._sampler_sigmas
-                    sample_scheduler._step_index = 0
-                    sample_scheduler._begin_index = 0
+                    noise_pred = self.noise_model(
+                        [block_latents],
+                        t=t.unsqueeze(0).expand(1, latent_frames_per_block),
+                        context=text_prompt_embeddings[0:1],
+                        seq_len=None,
+                        cond_states=dummy_cond,
+                        motion_latents=motion_latents,
+                        ref_latents=ref_image_latents,
+                        audio_input=block_audio,
+                        motion_frames=[self.motion_frames, latent_motion_frames],
+                        drop_motion_frames=False,
+                        kv_cache=step_kv,
+                        crossattn_cache=step_crossattn,
+                        current_start=token_start,
+                        current_end=token_end,
+                    )
 
-                    for step_index, t in enumerate(timesteps):
-                        if self.offload_kv_cache:
-                            self._move_kv_cache_to_device(self.device)
+                    if self.offload_kv_cache:
+                        self._move_kv_cache_to_device("cpu")
 
-                        step_kv = [
-                            {
-                                "k": layer["k"][step_index : step_index + 1],
-                                "v": layer["v"][step_index : step_index + 1],
-                                "cond_k": layer["cond_k"][step_index : step_index + 1],
-                                "cond_v": layer["cond_v"][step_index : step_index + 1],
-                                "cond_end": layer["cond_end"],
-                            }
-                            for layer in self.kv_cache
-                        ]
-                        step_crossattn = [
-                            {
-                                "k": layer["k"][step_index : step_index + 1],
-                                "v": layer["v"][step_index : step_index + 1],
-                                "is_init": layer["is_init"],
-                            }
-                            for layer in self.crossattn_cache
-                        ]
+                    block_latents = sample_scheduler.step(
+                        noise_pred[0].unsqueeze(0),
+                        t,
+                        block_latents.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g,
+                    )[0].squeeze(0)
 
-                        noise_pred = self.noise_model(
-                            [block_latents],
-                            t=t.unsqueeze(0).expand(1, latent_frames_per_block),
-                            context=text_prompt_embeddings[0:1],
-                            seq_len=None,
-                            cond_states=dummy_cond,
-                            motion_latents=input_motion_latents,
-                            ref_latents=ref_image_latents,
-                            audio_input=clip_audio[..., audio_start:audio_end],
-                            motion_frames=[self.motion_frames, latent_motion_frames],
-                            drop_motion_frames=False,
-                            kv_cache=step_kv,
-                            crossattn_cache=step_crossattn,
-                            current_start=token_start,
-                            current_end=token_end,
-                        )
+                all_block_latents.append(block_latents.detach().cpu())
 
-                        if self.offload_kv_cache:
-                            self._move_kv_cache_to_device("cpu")
+                # AAS: after first block, replace sink with generated latent
+                if block_index == 0:
+                    ref_image_latents = block_latents.unsqueeze(0)[:, :, 0:1]
 
-                        block_latents = sample_scheduler.step(
-                            noise_pred[0].unsqueeze(0),
-                            t,
-                            block_latents.unsqueeze(0),
-                            return_dict=False,
-                            generator=seed_g,
-                        )[0].squeeze(0)
-
-                    clip_output[:, block_start:block_end] = block_latents
-
-                    # AAS: after first block, replace sink with generated latent
-                    if clip_index == 0 and block_index == 0:
-                        ref_image_latents = block_latents.unsqueeze(0)[:, :, 0:1]
-
-                clip_latent_outputs.append(clip_output.detach().cpu())
-
-        # ---- 3. Deferred VAE decode ----
-        print("complete full-sequence generation")
-        if clip_latent_outputs:
+        # ---- 3. Deferred VAE decode (clip-sized chunks with motion re-encoding) ----
+        print(f"DiT generation complete ({total_blocks} blocks). Starting VAE decode...")
+        decoded_clips = []
+        if all_block_latents:
             if offload_model:
-                print("loading VAE for final decode")
                 self.kv_cache = None
+                self.crossattn_cache = None
                 self.vae.model.to(self.device)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
             motion_latents_decode = motion_latents
-            for clip_idx, clip_latent_cpu in enumerate(clip_latent_outputs):
-                clip_latent = clip_latent_cpu.to(device=self.vae.device, dtype=self.vae.dtype)
-                decode_input = torch.cat([motion_latents_decode, clip_latent.unsqueeze(0)], dim=2)
+            for chunk_start in range(0, total_blocks, blocks_per_decode_chunk):
+                chunk_end = min(chunk_start + blocks_per_decode_chunk, total_blocks)
+                chunk_latent = (
+                    torch.cat(all_block_latents[chunk_start:chunk_end], dim=1)
+                    .unsqueeze(0)
+                    .to(device=self.vae.device, dtype=self.vae.dtype)
+                )
+
+                decode_input = torch.cat([motion_latents_decode, chunk_latent], dim=2)
                 image = torch.stack(self.vae.decode(decode_input))
-                image = image[:, :, -(infer_frames):]
-                if clip_idx == 0:
+
+                # Trim: keep only generated frames (not motion prefix)
+                n_generated = (chunk_end - chunk_start) * latent_frames_per_block * self.vae_temporal_stride
+                image = image[:, :, -n_generated:]
+                if chunk_start == 0:
                     image = image[:, :, self.DECODE_SKIP_PIXEL_FRAMES :]
 
+                # Update motion context for next chunk's VAE decode
                 overlap = min(self.motion_frames, image.shape[2])
                 motion_pixel_frames = torch.cat(
-                    [
-                        motion_pixel_frames[:, :, overlap:],
-                        image[:, :, -overlap:],
-                    ],
+                    [motion_pixel_frames[:, :, overlap:], image[:, :, -overlap:]],
                     dim=2,
                 )
                 motion_pixel_frames = motion_pixel_frames.to(
                     dtype=motion_latents_decode.dtype,
                     device=motion_latents_decode.device,
                 )
-                motion_latents_decode = torch.stack(self.vae.encode(motion_pixel_frames)).type_as(clip_latent)
+                motion_latents_decode = torch.stack(self.vae.encode(motion_pixel_frames)).type_as(chunk_latent)
                 decoded_clips.append(image.cpu())
 
         video = torch.cat(decoded_clips, dim=2)
-        del clip_noise, clip_output
         self._sampler_timesteps = None
         self._sampler_sigmas = None
         self.kv_cache = None
