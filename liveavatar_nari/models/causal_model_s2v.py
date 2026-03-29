@@ -1,7 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
 import random
-import types
 from copy import deepcopy
 
 import numpy as np
@@ -10,11 +9,6 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
-from torch.nn.attention.flex_attention import (
-    create_block_mask,
-    flex_attention,
-    BlockMask,
-)
 from ..distributed.sequence_parallel import (
     gather_forward,
     get_rank,
@@ -94,8 +88,7 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         seq_lens,
         grid_sizes,
         freqs,
-        block_mask,
-        kv_cache=None,
+        kv_cache,
         current_start=0,
         current_end=0,
         sp_size=None,
@@ -119,8 +112,6 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
             return q, k, v
 
         q, k, v = qkv_fn(x)
-
-        assert kv_cache is not None, "non-cached forward not supported"
 
         if seg_idx[1] - seg_idx[0] > 0:  # streaming inference
             roped_query = causal_rope_apply(q, grid_sizes, freqs).type_as(v)
@@ -263,9 +254,8 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
         freqs,
         context,
         context_lens,
-        block_mask,
         frame_seqlen,
-        kv_cache=None,
+        kv_cache,
         crossattn_cache=None,
         current_start=0,
         current_end=0,
@@ -318,7 +308,6 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
             seq_lens,
             grid_sizes,
             freqs,
-            block_mask,
             kv_cache,
             current_start,
             current_end,
@@ -363,7 +352,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         "window_size",
     ]
     _no_split_modules = ["CausalWanS2VAttentionBlock"]
-    _supports_gradient_checkpointing = True
 
     @register_to_config
     def __init__(
@@ -468,7 +456,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         # initialize weights
         self.init_weights()
-        self.gradient_checkpointing = False
 
         self.use_context_parallel = False  # will modify in _configure_model func
         self.sp_size = None  # will be set in _configure_model func
@@ -515,15 +502,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 slide_motion_frames=slide_motion_frames,
             )
 
-        self.block_mask = None
-        self.num_frame_per_block = 1  # only affects causal mask during training
-
-    def enable_gradient_checkpointing(self):
-        self._set_gradient_checkpointing(value=True)
-
-    def _set_gradient_checkpointing(self, module=None, value=False):
-        self.gradient_checkpointing = value
-
     def init_weights(self):
         """Initialize model parameters using Xavier initialization."""
         for m in self.modules():
@@ -561,9 +539,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         self,
         motion_latents,
         drop_motion_frames=False,
-        drop_part_motion_frames=False,
-        motion_frames=None,
-        num_frames=None,
         add_last_motion=2,
         rollout_num_frames=0,
         sequence_current_start_frames=0,
@@ -583,29 +558,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 motion_rope_cache,
             )
         else:
-            if drop_part_motion_frames:
-                start_non_zero_idx = max(0, motion_frames[1] - num_frames)
-                if start_non_zero_idx > 0:
-                    flattern_mot = [
-                        torch.cat(
-                            [
-                                torch.zeros_like(m[:, :start_non_zero_idx]),
-                                m[:, start_non_zero_idx:],
-                            ],
-                            dim=1,
-                        )
-                        for m in flattern_mot
-                    ]
-                    mot_remb = [
-                        torch.cat(
-                            [
-                                torch.zeros_like(m[:, :start_non_zero_idx]),
-                                m[:, start_non_zero_idx:],
-                            ],
-                            dim=1,
-                        )
-                        for m in mot_remb
-                    ]
             return flattern_mot, mot_remb, motion_rope_cache
 
     def inject_motion(
@@ -616,9 +568,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         mask_input,
         motion_latents,
         drop_motion_frames=False,
-        drop_part_motion_frames=False,
-        motion_frames=None,
-        num_frames=None,
         add_last_motion=True,
         rollout_num_frames=0,
         sequence_current_start=0,
@@ -628,9 +577,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         mot, mot_remb, motion_rope_cache = self.process_motion_frame_pack(
             motion_latents,
             drop_motion_frames=drop_motion_frames,
-            drop_part_motion_frames=drop_part_motion_frames,
-            motion_frames=motion_frames,
-            num_frames=num_frames,
             add_last_motion=add_last_motion,
             rollout_num_frames=rollout_num_frames,
             sequence_current_start_frames=sequence_current_start,
@@ -721,58 +667,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 hidden_states, _ = pad_chunk(hidden_states, sp_size, dim=1)
 
         return hidden_states
-
-    # --- Attention mask ---
-
-    @staticmethod
-    def _prepare_blockwise_causal_attn_mask(
-        device: torch.device | str,
-        num_frames: int = 21,
-        frame_seqlen: int = 1560,
-        num_frame_per_block=1,
-        motion_and_ref_seqlen: int = 0,
-    ) -> BlockMask:
-        """
-        we will divide the token sequence into the following format
-        [1 latent frame] [1 latent frame] ... [1 latent frame]
-        We use flexattention to construct the attention mask
-        """
-        total_length = num_frames * frame_seqlen + motion_and_ref_seqlen
-
-        # we do right padding to get to a multiple of 128
-        padded_length = math.ceil(total_length / 128) * 128 - total_length
-
-        ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
-
-        # Block-wise causal mask will attend to all elements that are before the end of the current chunk
-        frame_indices = torch.arange(
-            start=0,
-            end=num_frames * frame_seqlen,
-            step=frame_seqlen * num_frame_per_block,
-            device=device,
-        )
-
-        for tmp in frame_indices:
-            ends[tmp : tmp + frame_seqlen * num_frame_per_block] = tmp + frame_seqlen * num_frame_per_block
-
-        ends_kv = torch.zeros_like(ends)
-        ends_kv[num_frames * frame_seqlen : total_length] = total_length
-
-        def attention_mask(b, h, q_idx, kv_idx):
-            return (kv_idx < ends[q_idx]) | (q_idx == kv_idx) | (q_idx < ends_kv[kv_idx])
-            # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
-
-        block_mask = create_block_mask(
-            attention_mask,
-            B=None,
-            H=None,
-            Q_LEN=total_length + padded_length,
-            KV_LEN=total_length + padded_length,
-            _compile=False,
-            device=device,
-        )
-
-        return block_mask
 
     # ── shared helpers (Step 4) ──────────────────────────────────────────
 
@@ -960,7 +854,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             freqs=self.pre_compute_freqs,
             context=context,
             context_lens=None,
-            block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
@@ -975,10 +868,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                     "current_end": current_end,
                 }
             )
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(block, x, **kwargs, use_reentrant=False)
-            else:
-                x = block(x, **kwargs)
+            x = block(x, **kwargs)
 
     @conditional_compile
     def _forward_inference(
@@ -1086,7 +976,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             freqs=self.pre_compute_freqs,
             context=context,
             context_lens=None,
-            block_mask=self.block_mask,
             frame_seqlen=frame_seqlen,
             use_context_parallel=self.use_context_parallel,
             sp_size=self.sp_size,
@@ -1101,120 +990,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                     "freqs_cond": cond_pre_compute_freqs,
                 }
             )
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(block, x, **kwargs, use_reentrant=False)
-                x = self.after_transformer_block(idx, x)
-            else:
-                x = block(x, **kwargs)
-                x = self.after_transformer_block(idx, x, mask)
-
-        return self._postprocess_output(x, e, original_grid_sizes)
-
-    def _forward_train(
-        self,
-        x,
-        t,
-        context,
-        seq_len,
-        ref_latents,
-        motion_latents,
-        cond_states,
-        audio_input=None,
-        motion_frames=[17, 5],
-        add_last_motion=2,
-        drop_motion_frames=False,
-        drop_part_motion_frames=False,
-    ):
-        """Training forward pass (full sequence, blockwise causal mask, no KV cache)."""
-        add_last_motion = self.add_last_motion * add_last_motion
-        self._encode_audio(audio_input, motion_frames)
-        device = self.patch_embedding.weight.device
-        x = self._embed_patches_with_pose(x, cond_states)
-        x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
-        self.lat_motion_frames = motion_latents[0].shape[1]
-        x, seq_lens, grid_sizes = self._prepare_ref_tokens(ref_latents, x, seq_lens, grid_sizes)
-
-        # Mask: 0=noisy, 1=ref (motion=2 is set inside inject_motion)
-        mask_input = [torch.zeros([1, u.shape[1]], dtype=torch.long, device=x[0].device) for u in x]
-        for i in range(len(mask_input)):
-            mask_input[i][:, self.original_seq_len :] = 1
-
-        # RoPE
-        x = torch.cat(x)
-        b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
-        self.pre_compute_freqs = rope_precompute(x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None)
-
-        x = [u.unsqueeze(0) for u in x]
-        self.pre_compute_freqs = [u.unsqueeze(0) for u in self.pre_compute_freqs]
-
-        x, seq_lens, self.pre_compute_freqs, mask_input = self.inject_motion(
-            x,
-            seq_lens,
-            self.pre_compute_freqs,
-            mask_input,
-            motion_latents,
-            drop_motion_frames=drop_motion_frames,
-            drop_part_motion_frames=drop_part_motion_frames,
-            motion_frames=motion_frames,
-            num_frames=num_frames,
-            add_last_motion=add_last_motion,
-        )
-
-        x = torch.cat(x, dim=0)
-        self.pre_compute_freqs = torch.cat(self.pre_compute_freqs, dim=0)
-        mask_input = torch.cat(mask_input, dim=0)
-
-        x = x + self.trainable_cond_mask(mask_input).to(x.dtype)
-
-        if self.block_mask is None:
-            self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                device,
-                num_frames=num_frames,
-                frame_seqlen=frame_seqlen,
-                num_frame_per_block=self.num_frame_per_block,
-                motion_and_ref_seqlen=seq_lens[0] - self.original_seq_len,
-            )
-
-        e, e0 = self._compute_timestep_embeddings(t)
-        context = self._embed_context(context)
-
-        if self.use_context_parallel:
-            global_rank = get_rank()
-            model_sp_size = self.sp_size
-            sp_rank = global_rank % model_sp_size
-            x = torch.chunk(x, model_sp_size, dim=1)
-            sq_size = [u.shape[1] for u in x]
-            sq_start_size = sum(sq_size[:sp_rank])
-            x = x[sp_rank]
-            e0[1] = e0[1] - sq_start_size
-            self.pre_compute_freqs = torch.chunk(self.pre_compute_freqs, model_sp_size, dim=1)[sp_rank]
-
-        kwargs = dict(
-            e=e0,
-            seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
-            context=context,
-            context_lens=None,
-            block_mask=self.block_mask,
-            frame_seqlen=frame_seqlen,
-            use_context_parallel=self.use_context_parallel,
-            sp_size=self.sp_size,
-        )
-        for idx, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(block, x, **kwargs, use_reentrant=False)
-                x = self.after_transformer_block(idx, x)
-            else:
-                x = block(x, **kwargs)
-                x = self.after_transformer_block(idx, x)
+            x = block(x, **kwargs)
+            x = self.after_transformer_block(idx, x, mask)
 
         return self._postprocess_output(x, e, original_grid_sizes)
 
     def forward(self, *args, **kwargs):
-        if kwargs.get("kv_cache") is not None:
-            return self._forward_inference(*args, **kwargs)
-        return self._forward_train(*args, **kwargs)
+        return self._forward_inference(*args, **kwargs)
 
     # --- Output ---
 
