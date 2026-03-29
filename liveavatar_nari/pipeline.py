@@ -394,28 +394,43 @@ class WanS2V:
                 1, self.latent_channels, fpb, latent_h, latent_w, dtype=self.param_dtype, device=self.device
             )
 
+            S = sampling_steps
+            # In-flight pipeline state: one slot per denoising step
+            inflight_latents = [None] * S
+            inflight_audio = [None] * S
+            inflight_token_start = [0] * S
+            inflight_block_idx = [-1] * S
+
             all_block_latents = []
-            for block_idx in tqdm(range(total_blocks), desc="blocks"):
-                block_latents = torch.randn(
-                    self.latent_channels,
-                    fpb,
-                    latent_h,
-                    latent_w,
-                    dtype=self.param_dtype,
-                    device=self.device,
-                    generator=seed_g,
-                )
-                block_audio = audio_embeddings[
-                    ..., block_idx * audio_frames_per_block : (block_idx + 1) * audio_frames_per_block
-                ]
-                token_start = block_idx * tokens_per_block
+            total_groups = total_blocks + S - 1
 
-                scheduler.timesteps = timesteps
-                scheduler.sigmas = saved_sigmas
-                scheduler._step_index = 0
-                scheduler._begin_index = 0
+            for group in tqdm(range(total_groups), desc="blocks"):
+                for step_idx, t in reversed(list(enumerate(timesteps))):
+                    block_idx = group - step_idx
 
-                for step_idx, t in enumerate(timesteps):
+                    # Skip dummy blocks (warmup/drain)
+                    if block_idx < 0 or block_idx >= total_blocks:
+                        continue
+
+                    if step_idx == 0:
+                        # New block enters pipeline — generate noise
+                        inflight_latents[0] = torch.randn(
+                            self.latent_channels,
+                            fpb,
+                            latent_h,
+                            latent_w,
+                            dtype=self.param_dtype,
+                            device=self.device,
+                            generator=seed_g,
+                        )
+                        inflight_audio[0] = audio_embeddings[
+                            ..., block_idx * audio_frames_per_block : (block_idx + 1) * audio_frames_per_block
+                        ]
+                        inflight_token_start[0] = block_idx * tokens_per_block
+                        inflight_block_idx[0] = block_idx
+
+                    block_latents = inflight_latents[step_idx]
+
                     if self.offload_kv_cache:
                         self._move_kv_cache_to_device(self.device)
 
@@ -438,12 +453,13 @@ class WanS2V:
                         for l in self.crossattn_cache
                     ]
 
+                    token_start = inflight_token_start[step_idx]
                     noise_pred = self.noise_model(
                         [block_latents],
                         t=t.unsqueeze(0).expand(1, fpb),
                         context=text_embeddings[0:1],
                         cond_states=dummy_cond,
-                        audio_input=block_audio,
+                        audio_input=inflight_audio[step_idx],
                         motion_frames=[self.motion_frames, latent_motion_frames],
                         kv_cache=step_kv,
                         crossattn_cache=step_crossattn,
@@ -454,6 +470,9 @@ class WanS2V:
                     if self.offload_kv_cache:
                         self._move_kv_cache_to_device("cpu")
 
+                    scheduler.sigmas = saved_sigmas
+                    scheduler._step_index = step_idx
+                    scheduler._begin_index = 0
                     block_latents = scheduler.step(
                         noise_pred[0].unsqueeze(0),
                         t,
@@ -462,11 +481,20 @@ class WanS2V:
                         generator=seed_g,
                     )[0].squeeze(0)
 
-                all_block_latents.append(block_latents.detach().cpu())
-
-                # AAS: replace sink with first generated latent
-                if block_idx == 0:
-                    ref_image_latents = block_latents.unsqueeze(0)[:, :, 0:1]
+                    if step_idx == S - 1:
+                        # Block completed all steps — output it
+                        all_block_latents.append(block_latents.detach().cpu())
+                        inflight_latents[step_idx] = None
+                        # AAS: first completed block replaces sink
+                        if inflight_block_idx[step_idx] == 0:
+                            ref_image_latents = block_latents.unsqueeze(0)[:, :, 0:1]
+                    else:
+                        # Advance to next pipeline stage
+                        inflight_latents[step_idx + 1] = block_latents
+                        inflight_audio[step_idx + 1] = inflight_audio[step_idx]
+                        inflight_token_start[step_idx + 1] = inflight_token_start[step_idx]
+                        inflight_block_idx[step_idx + 1] = inflight_block_idx[step_idx]
+                        inflight_latents[step_idx] = None
 
         # ---- 4. Streaming VAE decode ----
         print(f"DiT complete ({total_blocks} blocks). Decoding...")
