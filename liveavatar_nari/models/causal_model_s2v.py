@@ -136,11 +136,6 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
                 [kv_cache["v"][:, :max_active_size], kv_cache["cond_v"][:, :active_cond_cache_size]],
                 dim=1,
             ),
-            k_lens=torch.tensor(
-                [active_sizes[bi] + active_cond_cache_size for bi in range(b)],
-                dtype=torch.int32,
-                device=x.device,
-            ),
             window_size=self.window_size,
         )
         return self._output(x)
