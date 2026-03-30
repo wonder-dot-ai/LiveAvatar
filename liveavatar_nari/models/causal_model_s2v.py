@@ -716,6 +716,94 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
         )
 
+    def _compute_noisy_rope(self, b, s, n, d, current_start, frame_seqlen, num_frames, grid_sizes, device):
+        """Vectorized RoPE for noisy tokens. Returns [B, S, 1, freq_dim] complex."""
+        c = d // 2
+        freqs_split = self.freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+        # Post-patch spatial dims (same for all batch items)
+        H = int(grid_sizes[0][1][0, 1])
+        W = int(grid_sizes[0][1][0, 2])
+        F = num_frames
+
+        # Per-batch temporal offsets
+        frame_offsets = current_start // frame_seqlen  # [B]
+        f_indices = frame_offsets.unsqueeze(1) + torch.arange(F, device=device)  # [B, F]
+        f_freqs = freqs_split[0][f_indices]  # [B, F, cf]
+
+        # Spatial freqs (shared across batch)
+        h_freqs = freqs_split[1][:H]  # [H, ch]
+        w_freqs = freqs_split[2][:W]  # [W, cw]
+
+        # Broadcast combine → [B, F, H, W, cf+ch+cw]
+        noisy_freqs = torch.cat(
+            [
+                f_freqs[:, :, None, None, :].expand(b, F, H, W, -1),
+                h_freqs[None, None, :, None, :].expand(b, F, H, W, -1),
+                w_freqs[None, None, None, :, :].expand(b, F, H, W, -1),
+            ],
+            dim=-1,
+        )
+
+        return noisy_freqs.reshape(b, F * H * W, 1, -1), frame_offsets
+
+    def _compute_cond_rope(self, b, frame_offsets, device, dtype):
+        """Vectorized Rolling RoPE for cond cache. Returns [B, cond_S, 1, freq_dim] complex."""
+        d = self.dim // self.num_heads
+        c = d // 2
+        freqs_split = self.freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+        cond_grid_sizes = self.rope_cache["grid_sizes"]
+
+        # Rolling RoPE per-batch offsets
+        rolling_offsets = torch.randint(4, 31, (b,), device=device)
+        start_idx = 30 - rolling_offsets  # [B]
+        num_frames_cond = torch.clamp(frame_offsets - start_idx, min=0)  # [B]
+
+        # Process each cond group
+        parts = []
+        for gi, cg in enumerate(cond_grid_sizes):
+            gF = int(cg[1][0, 0] - cg[0][0, 0])
+            gH = int(cg[1][0, 1] - cg[0][0, 1])
+            gW = int(cg[1][0, 2] - cg[0][0, 2])
+            if gF * gH * gW == 0:
+                continue
+
+            # Temporal indices: first non-empty group uses Rolling RoPE, others use fixed start
+            if gi <= 1:  # group 0 is empty (F=0), group 1 is ref tokens
+                gf_indices = num_frames_cond.unsqueeze(1) + torch.arange(gF, device=device)  # [B, gF]
+            else:
+                gf_start = int(cg[0][0, 0])
+                gf_indices = torch.arange(gf_start, gf_start + gF, device=device).unsqueeze(0).expand(b, -1)
+
+            gf_freqs = freqs_split[0][gf_indices]  # [B, gF, cf]
+            gh_freqs = freqs_split[1][:gH]  # [gH, ch]
+            gw_freqs = freqs_split[2][:gW]  # [gW, cw]
+
+            group_freqs = torch.cat(
+                [
+                    gf_freqs[:, :, None, None, :].expand(b, gF, gH, gW, -1),
+                    gh_freqs[None, None, :, None, :].expand(b, gF, gH, gW, -1),
+                    gw_freqs[None, None, None, :, :].expand(b, gF, gH, gW, -1),
+                ],
+                dim=-1,
+            ).reshape(b, gF * gH * gW, 1, -1)
+            parts.append(group_freqs)
+
+        if parts:
+            cond_freqs = torch.cat(parts, dim=1)
+        else:
+            cond_freqs = torch.zeros(b, 0, 1, c, device=device, dtype=self.freqs.dtype)
+
+        # Pad to match rope_cache["cond_shape"] seq_len
+        cond_s = self.rope_cache["cond_shape"][1]
+        if cond_freqs.shape[1] < cond_s:
+            pad = torch.zeros(
+                b, cond_s - cond_freqs.shape[1], 1, cond_freqs.shape[-1], device=device, dtype=cond_freqs.dtype
+            )
+            cond_freqs = torch.cat([cond_freqs, pad], dim=1)
+
+        return cond_freqs
+
     def _postprocess_output(self, x, e, original_grid_sizes):
         """Gather context-parallel, slice to original seq_len, apply head, unpatchify."""
         if self.use_context_parallel:
@@ -879,39 +967,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         x = x  # already [B, L, dim] — no cat needed
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
 
-        # RoPE per batch item (handles both scalar and tensor current_start)
-        frame_seqlen_int = int(frame_seqlen)
-        freqs_list = []
-        cond_freqs_list = []
-        for bi in range(b):
-            cs_bi = int(current_start[bi].item()) if isinstance(current_start, torch.Tensor) else int(current_start)
-            frame_offset_bi = cs_bi // frame_seqlen_int
+        # Noisy token RoPE — vectorized (no Python loop)
+        self.pre_compute_freqs, frame_offsets = self._compute_noisy_rope(
+            b, s, n, d, current_start, frame_seqlen, num_frames, grid_sizes, x.device
+        )
 
-            gs_bi = [[g[bi : bi + 1].clone() for g in group] for group in grid_sizes]
-            gs_bi_shifted = rollout_grid_sizes(gs_bi, frame_offset_bi)
-
-            x_bi = x[bi : bi + 1].detach().view(1, s, n, d)
-            f_bi = rope_precompute(x_bi, gs_bi_shifted, self.freqs, start=None)
-            freqs_list.append(f_bi)
-
-            # Rolling RoPE for sink cond
-            relative_dist = random.randint(4, 30)
-            start_idx = 30 - relative_dist
-            num_frames_cond = max(0, frame_offset_bi - start_idx)
-            cond_shape_bi = list(self.rope_cache["cond_shape"])
-            cond_shape_bi[0] = 1
-            cond_gs_bi = [[g[0:1].clone() for g in group] for group in self.rope_cache["grid_sizes"]]
-            cond_gs_shifted = rollout_grid_sizes(cond_gs_bi, num_frames_cond)
-            cf_bi = rope_precompute(
-                torch.empty(cond_shape_bi).type_as(x),
-                cond_gs_shifted,
-                self.freqs,
-                start=None,
-            )
-            cond_freqs_list.append(cf_bi)
-
-        self.pre_compute_freqs = torch.cat(freqs_list, dim=0)
-        cond_pre_compute_freqs = torch.cat(cond_freqs_list, dim=0)
+        # Cond RoPE — vectorized (Rolling RoPE with torch.randint, loop over groups not batch)
+        cond_pre_compute_freqs = self._compute_cond_rope(b, frame_offsets, x.device, x.dtype)
         x = x + self.trainable_cond_mask(torch.zeros([1, x.shape[1]], dtype=torch.long, device=x.device)).to(x.dtype)
 
         e, e0 = self._compute_timestep_embeddings(t)
