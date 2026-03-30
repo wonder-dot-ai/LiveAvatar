@@ -82,12 +82,34 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         super().__init__(dim, num_heads, window_size, qk_norm, eps)
         self.local_attn_size = local_attn_size
 
+    def fuse_qkv(self):
+        """Fuse separate Q, K, V projections into a single QKV linear."""
+        if hasattr(self, "qkv"):
+            return  # already fused
+        dim = self.q.in_features
+        has_bias = self.q.bias is not None
+        self.qkv = nn.Linear(dim, 3 * dim, bias=has_bias, device=self.q.weight.device, dtype=self.q.weight.dtype)
+        self.qkv.weight.data[:dim] = self.q.weight.data
+        self.qkv.weight.data[dim : 2 * dim] = self.k.weight.data
+        self.qkv.weight.data[2 * dim :] = self.v.weight.data
+        if has_bias:
+            self.qkv.bias.data[:dim] = self.q.bias.data
+            self.qkv.bias.data[dim : 2 * dim] = self.k.bias.data
+            self.qkv.bias.data[2 * dim :] = self.v.bias.data
+        del self.q, self.k, self.v
+
     def _qkv(self, x):
         b, s = x.shape[:2]
         n, d = self.num_heads, self.head_dim
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
+        if hasattr(self, "qkv"):
+            q, k, v = self.qkv(x).chunk(3, dim=-1)
+            q = self.norm_q(q).view(b, s, n, d)
+            k = self.norm_k(k).view(b, s, n, d)
+            v = v.view(b, s, n, d)
+        else:
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
         return q, k, v
 
     def _output(self, x):
@@ -186,7 +208,7 @@ class CausalWanS2VAttentionBlock(WanAttentionBlock):
     def _expand_modulation(self, x, e, seq_lens, frame_seqlen, is_prefill, use_context_parallel=False, sp_size=None):
         """Expand timestep modulation [B,F,6,2,dim] → tuple of 6 [B,L,dim] tensors."""
         assert e[0].dtype == torch.float32
-        original_seq_len = e[1].item()
+        original_seq_len = e[1].item() if isinstance(e[1], torch.Tensor) else e[1]
         e = e[0]  # [B, F, 6, 2, C]
 
         modulation = self.modulation.unsqueeze(1).unsqueeze(3)
@@ -439,6 +461,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 slide_motion_frames=slide_motion_frames,
             )
 
+    def fuse_projections(self):
+        """Fuse Q/K/V into single QKV linear for all attention layers. Call before FP8."""
+        for block in self.blocks:
+            block.self_attn.fuse_qkv()
+            block.cross_attn.fuse_kv()
+        print(f"Fused QKV/KV projections in {len(self.blocks)} blocks.")
+
     def init_weights(self):
         """Initialize model parameters using Xavier initialization."""
         for m in self.modules():
@@ -625,24 +654,20 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         self.merged_audio_emb = audio_emb[:, motion_frames[1] :, :]
 
     def _embed_patches_with_pose(self, x, cond_states):
-        """Patch-embed noisy latents and add pose conditioning."""
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
-        return [x_ + c for x_, c in zip(x, cond)]
+        """Patch-embed noisy latents and add pose conditioning. x: [B, C, F, H, W]."""
+        return self.patch_embedding(x) + self.cond_encoder(cond_states)
 
     def _flatten_to_sequence(self, x):
-        """Flatten patch-embedded tensors to sequence form and compute grid metadata."""
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        original_grid_sizes = deepcopy(grid_sizes)
-        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
-        num_frames = original_grid_sizes[0][0].item()
-        if num_frames > 0:
-            frame_seqlen = seq_lens[0] // num_frames
-        else:
-            frame_seqlen = grid_sizes[0][-1][:, 1:].prod()
-        return x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen
+        """Flatten patch-embedded [B, dim, F', H', W'] to [B, L, dim] with grid metadata."""
+        b = x.shape[0]
+        grid_size = torch.tensor(x.shape[2:], dtype=torch.long)  # [F', H', W'] — same for all
+        x = x.flatten(2).transpose(1, 2)  # [B, F'*H'*W', dim]
+        seq_len = x.shape[1]
+        original_grid_sizes = grid_size.unsqueeze(0).expand(b, -1)  # [B, 3]
+        grid_sizes = [[torch.zeros_like(original_grid_sizes), original_grid_sizes, original_grid_sizes]]
+        num_frames = grid_size[0].item()
+        frame_seqlen = seq_len // num_frames if num_frames > 0 else grid_size[1:].prod()
+        return x, seq_len, grid_sizes, original_grid_sizes, num_frames, frame_seqlen
 
     def _prepare_ref_tokens(self, ref_latents, x, seq_lens, grid_sizes):
         """Patch-embed ref image, create ref_grid_sizes, concatenate to sequence."""
@@ -697,8 +722,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             x = gather_forward(x.contiguous(), dim=1)
         x = x[:, : self.original_seq_len]
         x = self.head(x, e)
-        x = self.unpatchify(x, original_grid_sizes)
-        return [u for u in x]
+        return self.unpatchify(x, original_grid_sizes)
 
     # ── end shared helpers ───────────────────────────────────────────────
 
@@ -744,7 +768,13 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         # Create empty latent (no noisy content — this is prefill only)
         x = [torch.zeros([1, self.dim, 0, latent_h, latent_w], dtype=torch.bfloat16, device=device)] * bs
 
-        x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
+        # Flatten (list-based for prefill since _prepare_ref_tokens works with lists)
+        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        x = [u.flatten(2).transpose(1, 2) for u in x]
+        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+        original_grid_sizes = grid_sizes.clone()
+        grid_sizes = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
+        frame_seqlen = grid_sizes[0][-1][:, 1:].prod()
         self.h_patches = original_grid_sizes[0][1].item()
         self.w_patches = original_grid_sizes[0][2].item()
         self.lat_motion_frames = motion_latents[0].shape[1]
@@ -843,11 +873,10 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         """
         self._encode_audio(audio_input, motion_frames)
         x = self._embed_patches_with_pose(x, cond_states)
-        x, seq_lens, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
-        self.original_seq_len = seq_lens[0]
+        x, seq_len, grid_sizes, original_grid_sizes, num_frames, frame_seqlen = self._flatten_to_sequence(x)
+        self.original_seq_len = seq_len
 
-        # RoPE (inline — per-batch and cond variants differ from other forwards)
-        x = torch.cat(x)
+        x = x  # already [B, L, dim] — no cat needed
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
 
         # RoPE per batch item (handles both scalar and tensor current_start)
@@ -900,7 +929,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             x = block(
                 x,
                 e=e0,
-                seq_lens=seq_lens[0],
+                seq_lens=seq_len,
                 grid_sizes=grid_sizes,
                 freqs=self.pre_compute_freqs,
                 context=context,
@@ -940,4 +969,4 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             u = torch.einsum("fhwpqrc->cfphqwr", u)
             u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
             out.append(u)
-        return out
+        return torch.stack(out)  # [B, C, F, H, W]

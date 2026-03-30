@@ -86,6 +86,9 @@ def main():
         pipeline.save_model(args.save_merged)
         print(f"Re-run with --ckpt_dir {args.save_merged} (no --load_lora) for fast startup.")
 
+    # Fuse QKV/KV projections (before FP8 so fused weights get quantized together)
+    pipeline.noise_model.fuse_projections()
+
     # FP8 conversion
     if args.fp8:
         if hasattr(torch, "_scaled_mm"):

@@ -9,8 +9,8 @@ logger = logging.getLogger()
 @torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
 def quant_fp8(input, target_dtype=torch.float8_e4m3fn):
     max_value = torch.finfo(target_dtype).max
-    amax_input = torch.max(torch.abs(input)).float()
-    input_scale = (max_value / torch.clamp(amax_input, min=1e-12)).clamp(max=max_value)
+    amax_input = input.abs().amax().float()
+    input_scale = max_value / amax_input.clamp(min=1e-12)
     input_fp8 = (input * input_scale).clamp(-max_value, max_value).to(target_dtype)
     return input_fp8, input_scale.reciprocal()
 

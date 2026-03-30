@@ -150,6 +150,20 @@ class WanSelfAttention(nn.Module):
 
 
 class WanCrossAttention(WanSelfAttention):
+    def fuse_kv(self):
+        """Fuse separate K, V projections into a single KV linear (both from context)."""
+        if hasattr(self, "kv"):
+            return
+        dim = self.k.in_features
+        has_bias = self.k.bias is not None
+        self.kv = nn.Linear(dim, 2 * dim, bias=has_bias, device=self.k.weight.device, dtype=self.k.weight.dtype)
+        self.kv.weight.data[:dim] = self.k.weight.data
+        self.kv.weight.data[dim:] = self.v.weight.data
+        if has_bias:
+            self.kv.bias.data[:dim] = self.k.bias.data
+            self.kv.bias.data[dim:] = self.v.bias.data
+        del self.k, self.v
+
     def forward(self, x, context, context_lens):
         r"""
         Args:
@@ -159,15 +173,16 @@ class WanCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        if hasattr(self, "kv"):
+            k, v = self.kv(context).chunk(2, dim=-1)
+            k = self.norm_k(k).view(b, -1, n, d)
+            v = v.view(b, -1, n, d)
+        else:
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
 
-        # compute attention
         x = flash_attention(q, k, v, k_lens=context_lens)
-
-        # output
         x = x.flatten(2)
         x = self.o(x)
         return x

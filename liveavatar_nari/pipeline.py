@@ -429,8 +429,8 @@ class WanS2V:
                     batch_block_idx[0] = -1
 
                 # ---- Step 2: Batched inference (batch_size = S) ----
-                noise_pred_list = self.noise_model(
-                    [batch_latents[i] for i in range(S)],
+                noise_pred = self.noise_model(
+                    batch_latents,
                     t=batch_t,
                     context=batch_context,
                     cond_states=batch_cond,
@@ -443,7 +443,6 @@ class WanS2V:
                 )
 
                 # ---- Step 3: Batched euler step + advance pipeline ----
-                noise_pred = torch.stack(noise_pred_list)  # [S, C, F, H, W]
                 results = batch_latents + euler_dt.view(S, 1, 1, 1, 1) * noise_pred
 
                 # Output completed block (step S-1)
