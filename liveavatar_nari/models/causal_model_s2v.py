@@ -132,32 +132,28 @@ class CausalWanS2VSelfAttention(WanSelfAttention):
         roped_query = causal_rope_apply(q, grid_sizes, freqs).type_as(v)
         roped_key = causal_rope_apply(k, grid_sizes, freqs).type_as(v)
         seq_len = x.shape[1]
-
-        active_cond_cache_size = int(kv_cache["cond_end"])
         kv_max = kv_cache["k"].shape[1]
+        device = x.device
 
-        active_sizes = []
-        for bi in range(b):
-            cs_raw = int(current_start[bi].item()) if isinstance(current_start, torch.Tensor) else current_start
-            wrapped = cs_raw >= kv_max
-            cs = cs_raw % kv_max if wrapped else cs_raw
-            kv_cache["k"][bi, cs : cs + seq_len] = roped_key[bi]
-            kv_cache["v"][bi, cs : cs + seq_len] = v[bi]
-            active_sizes.append(kv_max if wrapped else cs + seq_len)
+        # Vectorized KV cache write (no Python loop)
+        cs_all = current_start % kv_max  # [B]
+        offsets = cs_all.unsqueeze(1) + torch.arange(seq_len, device=device)  # [B, seq_len]
+        batch_idx = torch.arange(b, device=device).unsqueeze(1).expand_as(offsets)
+        kv_cache["k"][batch_idx, offsets] = roped_key
+        kv_cache["v"][batch_idx, offsets] = v
 
-        max_active_size = max(active_sizes)
+        # Dynamic slice to valid entries only (zeros would steal attention mass)
+        wrapped = current_start >= kv_max
+        active_sizes = torch.where(wrapped, kv_max, cs_all + seq_len)
+        max_active_size = int(active_sizes.max().item())
+        active_cond_size = int(kv_cache["cond_end"])
 
-        cond_k_roped = causal_rope_apply_cond(kv_cache["cond_k"][:, :active_cond_cache_size], None, freqs_cond).type_as(
-            v
-        )
+        cond_k_roped = causal_rope_apply_cond(kv_cache["cond_k"][:, :active_cond_size], None, freqs_cond).type_as(v)
 
         x = attention(
             q=roped_query,
             k=torch.cat([kv_cache["k"][:, :max_active_size], cond_k_roped], dim=1),
-            v=torch.cat(
-                [kv_cache["v"][:, :max_active_size], kv_cache["cond_v"][:, :active_cond_cache_size]],
-                dim=1,
-            ),
+            v=torch.cat([kv_cache["v"][:, :max_active_size], kv_cache["cond_v"][:, :active_cond_size]], dim=1),
             window_size=self.window_size,
         )
         return self._output(x)
@@ -622,8 +618,6 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
                 residual_out = residual_out.sum(dim=0, keepdim=True)
                 residual_out = rearrange(residual_out, "b t h w c -> b (t h w) c")
             elif num_actors > 1 and num_actors != hidden_states.shape[0]:
-                # Multi-actor SAM2 case requires a mask; batched pipeline
-                # (num_actors == batch_size) is fine without one.
                 assert False, "num_actors should be equal to num_mask, but no mask is provided."
 
             hidden_states[:, : self.original_seq_len] = hidden_states[:, : self.original_seq_len] + residual_out
@@ -747,7 +741,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
 
         return noisy_freqs.reshape(b, F * H * W, 1, -1), frame_offsets
 
-    def _compute_cond_rope(self, b, frame_offsets, device, dtype):
+    def _compute_cond_rope(self, b, frame_offsets, device, dtype, cond_cache_size=None):
         """Vectorized Rolling RoPE for cond cache. Returns [B, cond_S, 1, freq_dim] complex."""
         d = self.dim // self.num_heads
         c = d // 2
@@ -794,8 +788,8 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
         else:
             cond_freqs = torch.zeros(b, 0, 1, c, device=device, dtype=self.freqs.dtype)
 
-        # Pad to match rope_cache["cond_shape"] seq_len
-        cond_s = self.rope_cache["cond_shape"][1]
+        # Pad to match target cond cache size
+        cond_s = cond_cache_size if cond_cache_size is not None else self.rope_cache["cond_shape"][1]
         if cond_freqs.shape[1] < cond_s:
             pad = torch.zeros(
                 b, cond_s - cond_freqs.shape[1], 1, cond_freqs.shape[-1], device=device, dtype=cond_freqs.dtype
@@ -972,7 +966,7 @@ class CausalWanModel_S2V(ModelMixin, ConfigMixin):
             b, s, n, d, current_start, frame_seqlen, num_frames, grid_sizes, x.device
         )
 
-        # Cond RoPE — vectorized (Rolling RoPE with torch.randint, loop over groups not batch)
+        # Cond RoPE — vectorized (Rolling RoPE with torch.randint)
         cond_pre_compute_freqs = self._compute_cond_rope(b, frame_offsets, x.device, x.dtype)
         x = x + self.trainable_cond_mask(torch.zeros([1, x.shape[1]], dtype=torch.long, device=x.device)).to(x.dtype)
 

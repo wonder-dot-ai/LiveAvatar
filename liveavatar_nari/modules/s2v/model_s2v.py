@@ -61,39 +61,21 @@ def torch_dfs(model: nn.Module, parent_name="root"):
 
 
 @torch.amp.autocast("cuda", enabled=False)
-@conditional_compile
 def rope_apply(x, grid_sizes, freqs, start=None):
-    n, c = x.size(2), x.size(3) // 2
-    # loop over samples
-    output = []
-    for i, _ in enumerate(x):
-        s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-        freqs_i = freqs[i, :s]
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    """Batched RoPE application via complex multiply. No Python loop."""
+    b, s, n, d = x.shape
+    x_complex = torch.view_as_complex(x[:, :s].to(torch.float64).reshape(b, s, n, -1, 2))
+    result = torch.view_as_real(x_complex * freqs[:, :s]).flatten(3)
+    return result.float()
 
 
 @torch.amp.autocast("cuda", enabled=False)
-@conditional_compile
 def rope_apply_cond(x, grid_sizes, freqs, start=None):
-    n, c = x.size(2), x.size(3) // 2
-    # loop over samples
-    output = []
-    for i, _ in enumerate(x):
-        s = x.size(1)
-        x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(s, n, -1, 2))
-        freqs_i = freqs[i, :s]
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, s:]])
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).float()
+    """Batched RoPE application for conditioning. No Python loop."""
+    b, s, n, d = x.shape
+    x_complex = torch.view_as_complex(x[:, :s].to(torch.float64).reshape(b, s, n, -1, 2))
+    result = torch.view_as_real(x_complex * freqs[:, :s]).flatten(3)
+    return result.float()
 
 
 @torch.amp.autocast("cuda", enabled=False)
