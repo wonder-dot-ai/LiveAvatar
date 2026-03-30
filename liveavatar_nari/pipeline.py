@@ -390,89 +390,73 @@ class WanS2V:
             seed_g.manual_seed(seed)
 
             S = sampling_steps
-            dummy_latent = torch.zeros(
-                self.latent_channels, fpb, latent_h, latent_w, dtype=self.param_dtype, device=self.device
-            )
-            dummy_audio = torch.zeros_like(audio_embeddings[..., :audio_frames_per_block])
-            dummy_cond = torch.zeros(
-                1, self.latent_channels, fpb, latent_h, latent_w, dtype=self.param_dtype, device=self.device
-            )
 
-            # In-flight pipeline state: one slot per denoising step
-            inflight_latents = [dummy_latent.clone() for _ in range(S)]
-            inflight_audio = [dummy_audio.clone() for _ in range(S)]
-            inflight_token_start = [0] * S
-            inflight_block_idx = [-1] * S
+            # Pre-allocated batched tensors (fixed shape, no per-group allocation)
+            batch_latents = torch.zeros(
+                S, self.latent_channels, fpb, latent_h, latent_w, dtype=self.param_dtype, device=self.device
+            )
+            batch_audio = torch.zeros(
+                S, *audio_embeddings.shape[1:-1], audio_frames_per_block, dtype=self.param_dtype, device=self.device
+            )
+            batch_token_start = torch.zeros(S, dtype=torch.long, device=self.device)
+            batch_block_idx = torch.full((S,), -1, dtype=torch.long, device=self.device)
 
-            # Precompute per-step euler dt: dt[s] = sigma[s+1] - sigma[s]
+            # Precomputed constants (same for every group)
+            batch_t = timesteps.unsqueeze(1).expand(S, fpb)
+            batch_context = text_embeddings[0:1] * S
+            batch_cond = torch.zeros(
+                S, self.latent_channels, fpb, latent_h, latent_w, dtype=self.param_dtype, device=self.device
+            )
             euler_dt = sigmas[1 : S + 1] - sigmas[:S]  # [S]
+            motion_frames_const = [self.motion_frames, latent_motion_frames]
 
             all_block_latents = []
             total_groups = total_blocks + S - 1
 
             for group in tqdm(range(total_groups), desc="blocks"):
-                # ---- Step 1: Gather — inject new block at step 0 ----
-                new_block_idx = group
-                if 0 <= new_block_idx < total_blocks:
-                    inflight_latents[0] = torch.randn(
-                        self.latent_channels,
-                        fpb,
-                        latent_h,
-                        latent_w,
-                        dtype=self.param_dtype,
-                        device=self.device,
-                        generator=seed_g,
-                    )
-                    inflight_audio[0] = audio_embeddings[
-                        ..., new_block_idx * audio_frames_per_block : (new_block_idx + 1) * audio_frames_per_block
+                # ---- Step 1: Inject new block at step 0 ----
+                if group < total_blocks:
+                    batch_latents[0].normal_(generator=seed_g)
+                    batch_audio[0] = audio_embeddings[
+                        0, :, :, group * audio_frames_per_block : (group + 1) * audio_frames_per_block
                     ]
-                    inflight_token_start[0] = new_block_idx * tokens_per_block
-                    inflight_block_idx[0] = new_block_idx
+                    batch_token_start[0] = group * tokens_per_block
+                    batch_block_idx[0] = group
                 else:
-                    inflight_latents[0] = dummy_latent.clone()
-                    inflight_audio[0] = dummy_audio
-                    inflight_token_start[0] = 0
-                    inflight_block_idx[0] = -1
+                    batch_latents[0].zero_()
+                    batch_audio[0].zero_()
+                    batch_token_start[0] = 0
+                    batch_block_idx[0] = -1
 
                 # ---- Step 2: Batched inference (batch_size = S) ----
-                batch_kv = [
-                    {"k": l["k"], "v": l["v"], "cond_k": l["cond_k"], "cond_v": l["cond_v"], "cond_end": l["cond_end"]}
-                    for l in self.kv_cache
-                ]
-                batch_crossattn = [{"k": l["k"], "v": l["v"], "is_init": l["is_init"]} for l in self.crossattn_cache]
-
                 noise_pred_list = self.noise_model(
-                    inflight_latents,
-                    t=timesteps.unsqueeze(1).expand(S, fpb),
-                    context=text_embeddings[0:1] * S,
-                    cond_states=dummy_cond.expand(S, -1, -1, -1, -1),
-                    audio_input=torch.cat(inflight_audio, dim=0),
-                    motion_frames=[self.motion_frames, latent_motion_frames],
-                    kv_cache=batch_kv,
-                    crossattn_cache=batch_crossattn,
-                    current_start=torch.tensor(inflight_token_start, device=self.device),
+                    [batch_latents[i] for i in range(S)],
+                    t=batch_t,
+                    context=batch_context,
+                    cond_states=batch_cond,
+                    audio_input=batch_audio,
+                    motion_frames=motion_frames_const,
+                    kv_cache=self.kv_cache,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=batch_token_start,
                     current_end=0,
                 )
 
-                # ---- Step 3: Euler step + advance pipeline (reverse to avoid slot conflicts) ----
-                for step_idx in reversed(range(S)):
-                    block_idx = inflight_block_idx[step_idx]
-                    pred = noise_pred_list[step_idx]
-                    dt = euler_dt[step_idx]
-                    result = inflight_latents[step_idx] + dt * pred
+                # ---- Step 3: Batched euler step + advance pipeline ----
+                noise_pred = torch.stack(noise_pred_list)  # [S, C, F, H, W]
+                results = batch_latents + euler_dt.view(S, 1, 1, 1, 1) * noise_pred
 
-                    if step_idx == S - 1:
-                        # Block completed — output (skip dummies)
-                        if block_idx >= 0:
-                            all_block_latents.append(result.detach().cpu())
-                            if block_idx == 0:
-                                ref_image_latents = result.unsqueeze(0)[:, :, 0:1]
-                    else:
-                        # Advance to next pipeline stage (slot 0 is overwritten by next gather)
-                        inflight_latents[step_idx + 1] = result
-                        inflight_audio[step_idx + 1] = inflight_audio[step_idx]
-                        inflight_token_start[step_idx + 1] = inflight_token_start[step_idx]
-                        inflight_block_idx[step_idx + 1] = inflight_block_idx[step_idx]
+                # Output completed block (step S-1)
+                if batch_block_idx[S - 1] >= 0:
+                    all_block_latents.append(results[S - 1].detach().cpu())
+                    if batch_block_idx[S - 1] == 0:
+                        ref_image_latents = results[S - 1].unsqueeze(0)[:, :, 0:1]
+
+                # Shift pipeline: slot[i] moves to slot[i+1] (slot 0 overwritten by next gather)
+                batch_latents = torch.roll(results, 1, 0)
+                batch_audio = torch.roll(batch_audio, 1, 0)
+                batch_token_start = torch.roll(batch_token_start, 1, 0)
+                batch_block_idx = torch.roll(batch_block_idx, 1, 0)
 
         # ---- 4. Streaming VAE decode ----
         print(f"DiT complete ({total_blocks} blocks). Decoding...")
